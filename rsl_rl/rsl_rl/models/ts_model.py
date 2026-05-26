@@ -50,8 +50,7 @@ class Encoder(nn.Module):
         self.encoder = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        latent = self.encoder(x)
-        return nn.functional.normalize(latent, p=2, dim=-1)
+        return self.encoder(x)
 
 
 class TSModel(nn.Module):

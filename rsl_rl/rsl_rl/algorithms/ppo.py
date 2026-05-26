@@ -63,6 +63,8 @@ class PPO:
         student_reinforcing: bool = False,
         num_proprio_encoder_substeps: int = 1,
         grad_penalty_coef_schedule: list | None = None,
+        # Reward clipping (matches isaacgym clip_reward)
+        clip_reward: float | None = 100.0,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
@@ -117,6 +119,7 @@ class PPO:
         self.student_reinforcing = student_reinforcing
         self.num_proprio_encoder_substeps = num_proprio_encoder_substeps
         self.grad_penalty_coef_schedule = grad_penalty_coef_schedule
+        self.clip_reward = clip_reward
         self.counter = 0
 
         # PPO components
@@ -198,6 +201,8 @@ class PPO:
 
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
+        if self.clip_reward is not None:
+            rewards = rewards.clamp(-self.clip_reward, self.clip_reward)
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
 

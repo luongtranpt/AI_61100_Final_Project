@@ -74,7 +74,8 @@ def feet_distance(
     asset: Entity = env.scene[asset_cfg.name]
     foot_pos_w = asset.data.body_link_pos_w[:, env._wheels_link_ids, :2]
     dist = torch.norm(foot_pos_w[:, 0, :] - foot_pos_w[:, 1, :], dim=-1)
-    return torch.clamp(min_dist - dist, 0.0, 1.0) + torch.clamp(dist - max_dist, 0.0, 1.0)
+    raw = torch.clamp(min_dist - dist, 0.0, 1.0) + torch.clamp(dist - max_dist, 0.0, 1.0)
+    return raw.clamp(0.0, 0.05)  # weight=-100 → max weighted=-5
 
 
 def base_height_penalty(
@@ -84,7 +85,7 @@ def base_height_penalty(
 ) -> torch.Tensor:
     """Penalize deviation of base height from target (isaacgym style)."""
     asset: Entity = env.scene[asset_cfg.name]
-    return torch.abs(asset.data.root_link_pos_w[:, 2] - target)
+    return torch.abs(asset.data.root_link_pos_w[:, 2] - target).clamp(0.0, 0.25)  # weight=-20 → max weighted=-5
 
 
 # ── Velocity tracking ─────────────────────────────────────────────────────────
@@ -121,7 +122,7 @@ def tracking_lin_vel_pb(env: ManagerBasedRlEnv) -> torch.Tensor:
     just_reset = env.episode_length_buf <= 1
     delta = torch.where(just_reset, torch.zeros_like(current), current - env._prev_tracking_lin_vel)  # type: ignore
     env._prev_tracking_lin_vel = current.clone()  # type: ignore
-    return delta / env.step_dt
+    return (delta / env.step_dt).clamp(-5.0, 5.0)
 
 
 def tracking_ang_vel_pb(env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -132,7 +133,7 @@ def tracking_ang_vel_pb(env: ManagerBasedRlEnv) -> torch.Tensor:
     just_reset = env.episode_length_buf <= 1
     delta = torch.where(just_reset, torch.zeros_like(current), current - env._prev_tracking_ang_vel)  # type: ignore
     env._prev_tracking_ang_vel = current.clone()  # type: ignore
-    return delta / env.step_dt
+    return (delta / env.step_dt).clamp(-25.0, 25.0)
 
 
 # ── Penalties ─────────────────────────────────────────────────────────────────
@@ -150,7 +151,7 @@ def ang_vel_xy(
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     asset: Entity = env.scene[asset_cfg.name]
-    return torch.sum(torch.square(asset.data.root_link_ang_vel_b[:, :2]), dim=1)
+    return torch.sum(torch.square(asset.data.root_link_ang_vel_b[:, :2]), dim=1).clamp(0.0, 5.0 / 0.3)
 
 
 def orientation_penalty(
@@ -158,7 +159,7 @@ def orientation_penalty(
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     asset: Entity = env.scene[asset_cfg.name]
-    return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+    return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1).clamp(0.0, 5.0 / 12.0)
 
 
 def dof_acc(
@@ -176,7 +177,7 @@ def same_foot_x_position(
     """Penalize feet having different x positions in base frame."""
     asset: Entity = env.scene[asset_cfg.name]
     foot_pos_b = _get_foot_positions_b(env, asset)
-    return torch.abs(foot_pos_b[:, 0, 0] - foot_pos_b[:, 1, 0])
+    return torch.abs(foot_pos_b[:, 0, 0] - foot_pos_b[:, 1, 0]).clamp(0.0, 0.1)  # weight=-50 → max weighted=-5
 
 
 def same_foot_z_position(
@@ -186,7 +187,7 @@ def same_foot_z_position(
     """Penalize feet being at different heights in base frame."""
     asset: Entity = env.scene[asset_cfg.name]
     foot_pos_b = _get_foot_positions_b(env, asset)
-    return (foot_pos_b[:, 0, 2] - foot_pos_b[:, 1, 2]) ** 2
+    return ((foot_pos_b[:, 0, 2] - foot_pos_b[:, 1, 2]) ** 2).clamp(0.0, 0.05)  # weight=-100 → max weighted=-5
 
 
 def collision_penalty(
@@ -203,7 +204,7 @@ def collision_penalty(
     body_z = asset.data.body_link_pos_w[:, env._penalized_body_ids, 2]
     wheel_z = asset.data.body_link_pos_w[:, env._wheels_link_ids, 2].mean(dim=1, keepdim=True)
     contacts = (body_z < wheel_z + threshold).float()
-    return contacts.sum(dim=1)
+    return contacts.sum(dim=1).clamp(0.0, 0.1)  # weight=-50 → max weighted=-5
 
 
 def joint_vel_l2(

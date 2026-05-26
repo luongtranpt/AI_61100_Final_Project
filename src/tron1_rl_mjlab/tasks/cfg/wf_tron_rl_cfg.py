@@ -46,6 +46,8 @@ class RslRlTSPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     )
     """Lipschitz gradient-penalty schedule: [start_coef, end_coef, start_step, duration].
     Set to None to disable the penalty."""
+    clip_reward: Optional[float] = 100.0
+    """Clip total reward per step to [-clip_reward, clip_reward]. Matches isaacgym clip_reward."""
 
 
 def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
@@ -60,8 +62,8 @@ def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
         actor=RslRlTSActorCfg(
             hidden_dims=(512, 256, 128),
             activation="elu",
-            encoder_hidden_dims=(512, 256, 128),
-            encoder_latent_dim=32,
+            encoder_hidden_dims=(256, 128),
+            encoder_latent_dim=3,
             distribution_cfg={
                 "class_name": "rsl_rl.modules:GaussianDistribution",
                 "init_std": 1.0,
