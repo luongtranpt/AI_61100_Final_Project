@@ -55,3 +55,24 @@ def prepare_quantities(
     env._wheels_link_ids = wheel_link_idx  # type: ignore
     env._wheels_joint_ids = wheel_joint_ids  # type: ignore
     env._foot_radius = 0.127  # type: ignore
+
+
+def randomize_default_joint_pos(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    offset_range: tuple[float, float] = (-0.05, 0.05),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+    """Add random offset to default joint positions (matches isaacgym randomize_default_dof_pos)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    leg_joint_ids, _ = asset.find_joints("(?!wheel_).*")
+    n_envs = env.num_envs if env_ids is None else len(env_ids)
+    idx = slice(None) if env_ids is None else env_ids
+
+    if not hasattr(env, "_default_dof_pos_offset"):
+        env._default_dof_pos_offset = torch.zeros(  # type: ignore
+            env.num_envs, asset.data.joint_pos.shape[1], device=env.device
+        )
+
+    offset = torch.empty(n_envs, len(leg_joint_ids), device=env.device).uniform_(*offset_range)
+    env._default_dof_pos_offset[idx][:, leg_joint_ids] = offset  # type: ignore

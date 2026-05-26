@@ -1,4 +1,4 @@
-"""Reward functions for the task."""
+"""Reward functions matching isaacgym BipedWF."""
 
 from __future__ import annotations
 
@@ -12,125 +12,204 @@ from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def safety_reward_exp(
+def _get_foot_positions_b(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor:
+    """Foot (wheel) positions in base frame. Returns (N, 2, 3)."""
+    foot_pos_w = asset.data.body_link_pos_w[:, env._wheels_link_ids, :]
+    base_pos_w = asset.data.root_link_pos_w.unsqueeze(1).expand(-1, 2, -1)
+    base_quat_w = asset.data.root_link_quat_w.unsqueeze(1).expand(-1, 2, -1)
+    return quat_apply_inverse(base_quat_w, foot_pos_w - base_pos_w)
+
+
+# ── Balance / Safety ──────────────────────────────────────────────────────────
+
+def keep_balance(env: ManagerBasedRlEnv) -> torch.Tensor:
+    return torch.ones(env.num_envs, device=env.device)
+
+
+def nominal_foot_position(
         env: ManagerBasedRlEnv,
-        std: float,
-        base_height_target: float,
+        base_height_target: float = 0.7664,
+        std: float = 0.005,
+        std_wrt_v: float = 0.5,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+        command_name: str = "base_velocity",
+) -> torch.Tensor:
+    """Reward feet being at nominal height under the base (isaacgym style)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    foot_pos_b = _get_foot_positions_b(env, asset)  # (N, 2, 3)
+
+    nominal_foot_z = -(base_height_target - env._foot_radius)
+    reward = torch.zeros(env.num_envs, device=env.device)
+    for i in range(2):
+        height_err = nominal_foot_z - foot_pos_b[:, i, 2]
+        reward += torch.exp(-height_err ** 2 / std)
+    reward /= 2.0
+
+    vel_cmd = env.command_manager.get_command(command_name)
+    vel_norm = torch.norm(vel_cmd[:, :3], dim=1)
+    return reward * torch.exp(-vel_norm ** 2 / std_wrt_v)
+
+
+def leg_symmetry(
+        env: ManagerBasedRlEnv,
+        std: float = 0.001,
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Reward safety of base position and orientation using exponential kernel."""
+    """Reward symmetric lateral foot placement."""
     asset: Entity = env.scene[asset_cfg.name]
-
-    # Prepare variables
-    base_quat = asset.data.root_link_quat_w.unsqueeze(1).expand(-1, 2, -1)
-    base_position = asset.data.root_link_pos_w.unsqueeze(1).expand(-1, 2, -1)
-
-    # Compute the nominal foot error
-    foot_position = asset.data.body_link_pos_w[:, env._wheels_link_ids, :]
-    foot_position_b = quat_apply_inverse(base_quat, foot_position - base_position)
-    base_height = asset.data.root_link_pos_w[:, 2] - foot_position[:, :, 2].mean(dim=-1) + env._foot_radius
-
-    foot_pos_error_b = foot_position_b[:, :, :2] - env._nominal_foot_position_b[:, :2]
-
-    # adduction penalized harder
-    adduction = ((env._nominal_foot_position_b[:, 1] > 0.0) * (foot_pos_error_b[:, :, 1] < 0.0)) | (
-            (env._nominal_foot_position_b[:, 1] < 0.0) * (foot_pos_error_b[:, :, 1] > 0.0)
-    )
-
-    foot_pos_error_b[:, :, 1] = torch.where(
-        adduction, foot_pos_error_b[:, :, 1] / 0.1, foot_pos_error_b[:, :, 1] / 0.2
-    )
-    foot_pos_error_b[:, :, 0] = foot_pos_error_b[:, :, 0] / 0.2
-
-    foot_pos_error_b = torch.sum(torch.sum(foot_pos_error_b.abs(), dim=-1), dim=-1)
-    foot_pos_error_b = torch.clamp(foot_pos_error_b, max=8.0)
-
-    # Compute base posture error
-    base_orient_error_roll = torch.abs(asset.data.projected_gravity_b[:, 1]) / 0.1
-    base_orient_error_pitch = torch.abs(asset.data.projected_gravity_b[:, 0]) / 0.85
-    base_height_error = ((base_height - base_height_target) / 0.1) ** 2
-
-    # Compute base velocity error (penalizes spinning and fast motion)
-    wheel_vel_error = (torch.sum(torch.abs(asset.data.joint_vel[:, env._wheels_joint_ids]), dim=1) / 3.0).clip(max=4)
-    base_lin_vel_error = torch.norm(asset.data.root_link_lin_vel_b, p=2, dim=1) / 0.5
-    base_ang_vel_error = torch.norm(asset.data.root_link_ang_vel_b, p=2, dim=1) / 1.2
-
-    normalized_mani_error = (
-        foot_pos_error_b
-        + wheel_vel_error
-        + base_lin_vel_error
-        + base_ang_vel_error
-        + base_height_error * 0.5
-        + base_orient_error_roll * 0.5
-        + base_orient_error_pitch * 0.25
-    ) / 8.0
-
-    normalized_loco_error = (foot_pos_error_b / 2.0 + base_orient_error_pitch
-                             + base_orient_error_roll + base_height_error * 2.0) / 5.0
-
-    mani_safety_scale = torch.exp(-normalized_mani_error / std ** 2)
-    loco_safety_scale = torch.exp(-normalized_loco_error / std ** 2)
-
-    env._mani_safety_scale = mani_safety_scale + 0.4
-    env._loco_safety_scale = loco_safety_scale + 0.4
-
-    return mani_safety_scale * 0.5 + loco_safety_scale * 0.5
+    foot_pos_b = _get_foot_positions_b(env, asset)
+    err = torch.abs(foot_pos_b[:, 0, 1]) - torch.abs(foot_pos_b[:, 1, 1])
+    return torch.exp(-err ** 2 / std)
 
 
-def track_base_position_exp(
+def feet_distance(
         env: ManagerBasedRlEnv,
-        std: float,
-        command_name: str = "base_pose",
+        min_dist: float = 0.32,
+        max_dist: float = 0.35,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    position_error = env.command_manager.get_term(command_name).metrics["position_error"]
-    normal = torch.exp(-position_error / std ** 2)
-    micro_enhancement = torch.exp(-5 * position_error / std ** 2)
-    return (normal + micro_enhancement) * 0.5 * env._loco_safety_scale
+    """Penalize feet that are too close or too far apart."""
+    asset: Entity = env.scene[asset_cfg.name]
+    foot_pos_w = asset.data.body_link_pos_w[:, env._wheels_link_ids, :2]
+    dist = torch.norm(foot_pos_w[:, 0, :] - foot_pos_w[:, 1, :], dim=-1)
+    return torch.clamp(min_dist - dist, 0.0, 1.0) + torch.clamp(dist - max_dist, 0.0, 1.0)
 
 
-def track_base_orientation_exp(
+def base_height_penalty(
         env: ManagerBasedRlEnv,
-        std: float,
-        command_name: str = "base_pose",
+        target: float = 0.7664,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    base_position_error = env.command_manager.get_term(command_name).metrics["position_error"]
-    position_scale = torch.exp(-base_position_error / 0.5)
-    base_orientation_error = env.command_manager.get_term(command_name).metrics["orientation_error"]
-    normal = torch.exp(-base_orientation_error / std ** 2)
-    micro_enhancement = torch.exp(-5 * base_orientation_error / std ** 2)
-    return (normal + micro_enhancement) * position_scale * 0.5 * env._loco_safety_scale
+    """Penalize deviation of base height from target (isaacgym style)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.abs(asset.data.root_link_pos_w[:, 2] - target)
 
 
-def track_base_pb(env: ManagerBasedRlEnv, command_name: str = "base_pose") -> torch.Tensor:
-    optim_pos_distance = env.command_manager.get_term(command_name).optim_pos_distance
-    position_scale = torch.exp(-optim_pos_distance / 0.5)
-    optim_orient_distance = env.command_manager.get_term(command_name).optim_orient_distance
-    orient_scale = torch.exp(-optim_orient_distance / 0.5)
-    pos_improve = env.command_manager.get_term(command_name).pos_improvement
-    orient_improve = env.command_manager.get_term(command_name).orient_improvement
-    return (2 * pos_improve * position_scale + orient_improve * orient_scale) * env._loco_safety_scale
+# ── Velocity tracking ─────────────────────────────────────────────────────────
 
-
-def track_base_reference_exp(
+def tracking_lin_vel(
         env: ManagerBasedRlEnv,
-        std: float,
-        delta: float = 0.5,
-        command_name: str = "base_pose",
+        std: float = 0.2,
+        command_name: str = "base_velocity",
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    base_position_error = env.command_manager.get_term(command_name).metrics["position_error"]
-    base_orientation_error = env.command_manager.get_term(command_name).metrics["orientation_error"]
-    se3_distance_ref = env.command_manager.get_term(command_name).se3_distance_ref
-    track_error = torch.abs(se3_distance_ref - base_orientation_error - 2 * base_position_error) - delta
-    track_error = torch.clamp(track_error, min=0.0)
-    return torch.exp(-track_error / std ** 2) * 0.5 * env._loco_safety_scale
+    asset: Entity = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)[:, :2]
+    error = torch.sum(torch.square(cmd - asset.data.root_link_lin_vel_b[:, :2]), dim=1)
+    return torch.exp(-error / std ** 2)
+
+
+def tracking_ang_vel(
+        env: ManagerBasedRlEnv,
+        std: float = 0.25,
+        command_name: str = "base_velocity",
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)[:, 2]
+    error = torch.square(cmd - asset.data.root_link_ang_vel_b[:, 2])
+    return torch.exp(-error / std ** 2)
+
+
+def tracking_lin_vel_pb(env: ManagerBasedRlEnv) -> torch.Tensor:
+    current = tracking_lin_vel(env)
+    if not hasattr(env, "_prev_tracking_lin_vel"):
+        env._prev_tracking_lin_vel = current.clone()  # type: ignore
+        return torch.zeros(env.num_envs, device=env.device)
+    just_reset = env.episode_length_buf <= 1
+    delta = torch.where(just_reset, torch.zeros_like(current), current - env._prev_tracking_lin_vel)  # type: ignore
+    env._prev_tracking_lin_vel = current.clone()  # type: ignore
+    return delta / env.step_dt
+
+
+def tracking_ang_vel_pb(env: ManagerBasedRlEnv) -> torch.Tensor:
+    current = tracking_ang_vel(env)
+    if not hasattr(env, "_prev_tracking_ang_vel"):
+        env._prev_tracking_ang_vel = current.clone()  # type: ignore
+        return torch.zeros(env.num_envs, device=env.device)
+    just_reset = env.episode_length_buf <= 1
+    delta = torch.where(just_reset, torch.zeros_like(current), current - env._prev_tracking_ang_vel)  # type: ignore
+    env._prev_tracking_ang_vel = current.clone()  # type: ignore
+    return delta / env.step_dt
+
+
+# ── Penalties ─────────────────────────────────────────────────────────────────
+
+def lin_vel_z(
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.square(asset.data.root_link_lin_vel_b[:, 2])
+
+
+def ang_vel_xy(
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.sum(torch.square(asset.data.root_link_ang_vel_b[:, :2]), dim=1)
+
+
+def orientation_penalty(
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+
+
+def dof_acc(
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.sum(torch.square(asset.data.joint_acc), dim=1)
+
+
+def same_foot_x_position(
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize feet having different x positions in base frame."""
+    asset: Entity = env.scene[asset_cfg.name]
+    foot_pos_b = _get_foot_positions_b(env, asset)
+    return torch.abs(foot_pos_b[:, 0, 0] - foot_pos_b[:, 1, 0])
+
+
+def same_foot_z_position(
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize feet being at different heights in base frame."""
+    asset: Entity = env.scene[asset_cfg.name]
+    foot_pos_b = _get_foot_positions_b(env, asset)
+    return (foot_pos_b[:, 0, 2] - foot_pos_b[:, 1, 2]) ** 2
+
+
+def collision_penalty(
+        env: ManagerBasedRlEnv,
+        threshold: float = 0.05,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize knee/hip links being close to ground (contact proxy)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    if not hasattr(env, "_penalized_body_ids"):
+        knee_ids, _ = asset.find_bodies("knee_[RL]_Link")
+        hip_ids, _ = asset.find_bodies("hip_[RL]_Link")
+        env._penalized_body_ids = knee_ids + hip_ids  # type: ignore
+    body_z = asset.data.body_link_pos_w[:, env._penalized_body_ids, 2]
+    wheel_z = asset.data.body_link_pos_w[:, env._wheels_link_ids, 2].mean(dim=1, keepdim=True)
+    contacts = (body_z < wheel_z + threshold).float()
+    return contacts.sum(dim=1)
 
 
 def joint_vel_l2(
         env: ManagerBasedRlEnv,
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Penalize joint velocities on the articulation using L2 squared kernel."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.sum(torch.square(asset.data.joint_vel[:, asset_cfg.joint_ids]), dim=1)
 
@@ -141,70 +220,28 @@ def weighted_joint_torques_l2(
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     asset: Entity = env.scene[asset_cfg.name]
-
     if not asset.data.is_actuated:
         return torch.zeros(env.num_envs, device=env.device)
-
     weighted_torque = torch.zeros_like(asset.data.actuator_force)
-
     for joint_name, w in torque_weight.items():
         joint_idx, _ = asset.find_joints(joint_name)
         weighted_torque[:, joint_idx] = torch.square(asset.data.actuator_force[:, joint_idx]) * w
-
     return torch.sum(weighted_torque, dim=1)
 
 
-def weighted_joint_power_l1(
-        env: ManagerBasedRlEnv,
-        power_weight: dict[str, float],
-        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-) -> torch.Tensor:
-    asset: Entity = env.scene[asset_cfg.name]
-
-    if not asset.data.is_actuated:
-        return torch.zeros(env.num_envs, device=env.device)
-
-    weighted_power = torch.zeros_like(asset.data.actuator_force)
-
-    for joint_name, w in power_weight.items():
-        joint_idx, _ = asset.find_joints(joint_name)
-        # power = force * velocity
-        weighted_power[:, joint_idx] = (
-                torch.abs(asset.data.actuator_force[:, joint_idx] * asset.data.joint_vel[:, joint_idx]) * w
-        )
-
-    return torch.sum(weighted_power, dim=1)
-
-
-class ActionSmoothnessPenaltyWrapper:
-    def __init__(self):
-        self.prev_prev_action = None
-        self.prev_action = None
-        self.__name__ = "action_smoothness_penalty"
-
-    def __call__(self, env: ManagerBasedRlEnv) -> torch.Tensor:
-        """Penalize large instantaneous changes in the network action output"""
-        current_action = env.action_manager.action.clone()
-
-        if self.prev_action is None:
-            self.prev_action = current_action
-            return torch.zeros(current_action.shape[0], device=current_action.device)
-
-        if self.prev_prev_action is None:
-            self.prev_prev_action = self.prev_action
-            self.prev_action = current_action
-            return torch.zeros(current_action.shape[0], device=current_action.device)
-
-        penalty = torch.sum(torch.square(current_action - 2 * self.prev_action + self.prev_prev_action), dim=1)
-
-        # Update actions for next call
-        self.prev_prev_action = self.prev_action
-        self.prev_action = current_action
-
-        startup_env_musk = env.episode_length_buf < 3
-        penalty[startup_env_musk] = 0
-
-        return penalty
-
-
-action_smoothness_penalty = ActionSmoothnessPenaltyWrapper()
+def action_smoothness_penalty(env: ManagerBasedRlEnv) -> torch.Tensor:
+    current = env.action_manager.action.clone()
+    if not hasattr(env, "_smooth_prev"):
+        env._smooth_prev = current  # type: ignore
+        return torch.zeros(current.shape[0], device=current.device)
+    if not hasattr(env, "_smooth_prev_prev"):
+        env._smooth_prev_prev = env._smooth_prev  # type: ignore
+        env._smooth_prev = current  # type: ignore
+        return torch.zeros(current.shape[0], device=current.device)
+    penalty = torch.sum(
+        torch.square(current - 2 * env._smooth_prev + env._smooth_prev_prev), dim=1  # type: ignore
+    )
+    env._smooth_prev_prev = env._smooth_prev  # type: ignore
+    env._smooth_prev = current  # type: ignore
+    penalty[env.episode_length_buf < 3] = 0
+    return penalty

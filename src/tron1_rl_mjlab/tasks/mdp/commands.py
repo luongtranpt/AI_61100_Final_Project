@@ -343,3 +343,65 @@ class UniformWorldPoseCommandCfg(UniformPoseCommandCfg):
 
     def build(self, env: ManagerBasedRlEnv) -> UniformWorldPoseCommand:
         return UniformWorldPoseCommand(self, env)
+
+
+class UniformVelocityCommand(CommandTerm):
+    cfg: "UniformVelocityCommandCfg"
+
+    def __init__(self, cfg: "UniformVelocityCommandCfg", env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self.robot: Entity = env.scene[cfg.entity_name]
+        self.vel_command_b = torch.zeros(self.num_envs, 3, device=self.device)
+        self.metrics["lin_vel_error"] = torch.zeros(self.num_envs, device=self.device)
+
+    @property
+    def command(self) -> torch.Tensor:
+        return self.vel_command_b
+
+    def _update_metrics(self) -> None:
+        lin_vel_b = self.robot.data.root_link_lin_vel_b[:, :2]
+        cmd_xy = self.vel_command_b[:, :2]
+        self.metrics["lin_vel_error"] = torch.norm(cmd_xy - lin_vel_b, dim=1)
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        r = torch.empty(len(env_ids), device=self.device)
+        self.vel_command_b[env_ids, 0] = r.uniform_(*self.cfg.ranges.lin_vel_x)
+        self.vel_command_b[env_ids, 1] = r.uniform_(*self.cfg.ranges.lin_vel_y)
+        self.vel_command_b[env_ids, 2] = r.uniform_(*self.cfg.ranges.ang_vel_yaw)
+
+    def _update_command(self) -> None:
+        pass
+
+    def _debug_vis_impl(self, visualizer: DebugVisualizer) -> None:
+        for env_idx in visualizer.get_env_indices(self.num_envs):
+            pos = self.robot.data.root_link_pos_w[env_idx]
+            vel = self.vel_command_b[env_idx]
+            end = pos.clone()
+            end[0] += vel[0] * 0.5
+            end[1] += vel[1] * 0.5
+            visualizer.add_arrow(
+                start=pos,
+                end=end,
+                color=(0.0, 1.0, 0.0, 0.8),
+                label=f"vel_{env_idx}",
+            )
+
+
+@dataclass(kw_only=True)
+class UniformVelocityCommandCfg(CommandTermCfg):
+    entity_name: str
+
+    @dataclass
+    class Ranges:
+        lin_vel_x: tuple[float, float] = (-1.0, 1.0)
+        lin_vel_y: tuple[float, float] = (0.0, 0.0)
+        ang_vel_yaw: tuple[float, float] = (-1.0, 1.0)
+
+    ranges: Ranges = None  # type: ignore
+
+    def __post_init__(self):
+        if self.ranges is None:
+            self.ranges = UniformVelocityCommandCfg.Ranges()
+
+    def build(self, env: ManagerBasedRlEnv) -> UniformVelocityCommand:
+        return UniformVelocityCommand(self, env)

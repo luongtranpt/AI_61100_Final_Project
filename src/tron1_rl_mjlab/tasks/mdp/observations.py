@@ -133,3 +133,16 @@ def base_commands_vel_c(
 ) -> torch.Tensor:
     base_pose_command = env.command_manager.get_term(command_name)
     return base_pose_command.pose_command_vel_c
+
+
+def base_vel_commands(
+        env: ManagerBasedRlEnv,
+        command_name: str = "base_velocity",
+) -> torch.Tensor:
+    """Return velocity commands scaled to match isaacgym obs scaling.
+
+    Output: [lin_vel_x * 2.0, lin_vel_y * 2.0, ang_vel_yaw * 0.25]
+    """
+    cmd = env.command_manager.get_command(command_name)  # (N, 3)
+    scales = torch.tensor([2.0, 2.0, 0.25], device=env.device)
+    return cmd * scales

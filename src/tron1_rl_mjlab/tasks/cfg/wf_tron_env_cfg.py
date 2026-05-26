@@ -37,85 +37,72 @@ VIEWER_CONFIG = ViewerConfig(
 
 
 def make_commands() -> dict[str, CommandTermCfg]:
-    """Create command configurations."""
     return {
-        "base_pose": mdp.UniformWorldPoseCommandCfg(
+        "base_velocity": mdp.UniformVelocityCommandCfg(
             entity_name="robot",
-            body_name="base_Link",
-            resampling_time_range=(5.0, 10.0),
-            resampling_time_scale=(0.5, 5.0),
+            resampling_time_range=(5.0, 5.0),
             debug_vis=True,
-            ranges=mdp.UniformWorldPoseCommandCfg.Ranges(
-                # pos lin
-                pos_x=(-0.2, 0.2),  # min max [m]
-                pos_y=(-0.2, 0.2),  # min max [m]
-                # vel
-                vel_x=(-0.0, 0.0),  # min max [m/s] in target frame
-                vel_y=(-0.0, 0.0),  # min max [m/s] in target frame
-                vel_yaw=(-0.0, 0.0),  # min max [rad/s]
+            ranges=mdp.UniformVelocityCommandCfg.Ranges(
+                lin_vel_x=(-1.0, 1.0),
+                lin_vel_y=(0.0, 0.0),
+                ang_vel_yaw=(-0.6, 0.6),
             ),
-            se3_decrease_vel_range=(0.5, 1.4),
         )
     }
 
 
 def make_actions() -> dict[str, ActionTermCfg]:
-    """Create action configurations."""
     return {
         "joint_pos": mdp.JointPositionActionCfg(
             entity_name="robot",
             actuator_names=("abad_[RL]_Joint", "hip_[RL]_Joint", "knee_[RL]_Joint"),
-            scale=0.5,
-            use_default_offset=True
+            scale=0.25,
+            use_default_offset=True,
         ),
         "joint_vel": mdp.JointVelocityActionCfg(
             entity_name="robot",
             actuator_names=("wheel_[RL]_Joint",),
-            scale=5.0,
-            use_default_offset=True
-        )
+            scale=0.5,
+            use_default_offset=True,
+        ),
     }
 
 
 def make_observations() -> dict[str, ObservationGroupCfg]:
-    """Create observation configurations."""
-    # Commands observation terms
+    # Commands (3 dims: scaled vel)
     commands_terms = {
-        "base_pose_commands": ObservationTermCfg(func=mdp.base_commands_b),
-        # "fake_base_pose_commands": ObservationTermCfg(func=mdp.fake_base_commands_b),
-        "base_se3_decrease_rate": ObservationTermCfg(func=mdp.base_se3_decrease_rate),
-        "base_commands_vel": ObservationTermCfg(func=mdp.base_commands_vel_c),
+        "base_vel_commands": ObservationTermCfg(
+            func=mdp.base_vel_commands,
+            params={"command_name": "base_velocity"},
+        ),
     }
 
-    # Policy observation terms
+    # Policy obs — matches isaacgym obs_buf (28 dims) + commands (3) = 31 total
     policy_terms = {
-        # robot base measurements
         "base_ang_vel": ObservationTermCfg(
             func=mdp.base_ang_vel,
-            noise=GaussianNoiseCfg(mean=0.0, std=0.05),
+            noise=GaussianNoiseCfg(mean=0.0, std=0.3),
             scale=0.25,
         ),
         "proj_gravity": ObservationTermCfg(
             func=mdp.projected_gravity,
-            noise=GaussianNoiseCfg(mean=0.0, std=0.025),
+            noise=GaussianNoiseCfg(mean=0.0, std=0.075),
             scale=1.0,
         ),
-        # robot joint measurements exclude wheel pos
         "joint_pos": ObservationTermCfg(
             func=mdp.joint_pos_rel,
             params={"asset_cfg": SceneEntityCfg(
                 name="robot",
-                joint_names=("abad_[RL]_Joint", "hip_[RL]_Joint", "knee_[RL]_Joint")
+                joint_names=("abad_[RL]_Joint", "hip_[RL]_Joint", "knee_[RL]_Joint"),
             )},
-            noise=GaussianNoiseCfg(mean=0.0, std=0.01),
+            noise=GaussianNoiseCfg(mean=0.0, std=0.015),
             scale=1.0,
         ),
         "joint_vel": ObservationTermCfg(
             func=mdp.joint_vel_rel,
-            noise=GaussianNoiseCfg(mean=0.0, std=0.01),
+            noise=GaussianNoiseCfg(mean=0.0, std=2.25),
             scale=0.05,
         ),
-        # last action
         "last_action": ObservationTermCfg(
             func=mdp.last_action,
             noise=GaussianNoiseCfg(mean=0.0, std=0.01),
@@ -123,30 +110,9 @@ def make_observations() -> dict[str, ObservationGroupCfg]:
         ),
     }
 
-    # Critic observation terms
-    critic_terms = {
-        "base_lin_vel": ObservationTermCfg(func=mdp.base_lin_vel, scale=1.0),
-        "base_ang_vel": ObservationTermCfg(func=mdp.base_ang_vel, scale=0.25),
-        "proj_gravity": ObservationTermCfg(func=mdp.projected_gravity, scale=1.0),
-        "joint_pos": ObservationTermCfg(
-            func=mdp.joint_pos_rel,
-            params={"asset_cfg": SceneEntityCfg(
-                name="robot",
-                joint_names=("abad_[RL]_Joint", "hip_[RL]_Joint", "knee_[RL]_Joint")
-            )},
-            scale=1.0,
-        ),
-        "joint_vel": ObservationTermCfg(func=mdp.joint_vel_rel, scale=0.05),
-        "last_action": ObservationTermCfg(func=mdp.last_action, scale=1.0),
-        "joint_torque": ObservationTermCfg(func=mdp.actuator_force, scale=0.01),
-        "joint_acc": ObservationTermCfg(func=mdp.joint_acc, scale=0.1),
-        "feet_lin_vel": ObservationTermCfg(
-            func=mdp.body_lin_vel,
-            params={"asset_cfg": SceneEntityCfg("robot", body_names="wheel_.*")},
-            scale=0.1
-        ),
-        "base_height_error": ObservationTermCfg(func=mdp.base_height_error, scale=3.0),
-        "foot_rel_position_w": ObservationTermCfg(func=mdp.foot_rel_position_w, scale=1.5),
+    # Critic gets base_lin_vel (privileged) + commands + policy
+    critic_extra = {
+        "base_lin_vel": ObservationTermCfg(func=mdp.base_lin_vel, scale=2.0),
     }
 
     return {
@@ -159,11 +125,11 @@ def make_observations() -> dict[str, ObservationGroupCfg]:
             terms=commands_terms | policy_terms,
             enable_corruption=True,
             concatenate_terms=True,
-            history_length=20,
+            history_length=10,
             flatten_history_dim=True,
         ),
         "critic": ObservationGroupCfg(
-            terms=commands_terms | critic_terms,
+            terms=commands_terms | critic_extra | policy_terms,
             enable_corruption=False,
             concatenate_terms=True,
         ),
@@ -171,9 +137,8 @@ def make_observations() -> dict[str, ObservationGroupCfg]:
 
 
 def make_events() -> dict[str, EventTermCfg]:
-    """Create event configurations."""
     return {
-        # Startup events
+        # Startup
         "prepare_quantities": EventTermCfg(
             func=mdp.prepare_quantities,
             mode="startup",
@@ -204,9 +169,9 @@ def make_events() -> dict[str, EventTermCfg]:
             mode="startup",
             params={
                 "ranges": {
-                    0: (0.4, 1.2),  # Static friction
-                    1: (0.2, 0.9),  # Dynamic friction (torsional)
-                    2: (0.0, 1.0),  # Rolling friction
+                    0: (0.2, 1.6),
+                    1: (0.2, 0.9),
+                    2: (0.0, 1.0),
                 },
                 "operation": "abs",
                 "distribution": "uniform",
@@ -218,16 +183,36 @@ def make_events() -> dict[str, EventTermCfg]:
             mode="startup",
             params={
                 "ranges": {
-                    0: (-0.03, 0.03),  # X axis
-                    1: (-0.03, 0.03),  # Y axis
-                    2: (-0.03, 0.03),  # Z axis
+                    0: (-0.03, 0.03),
+                    1: (-0.02, 0.02),
+                    2: (-0.03, 0.03),
                 },
                 "operation": "add",
                 "distribution": "uniform",
                 "asset_cfg": SceneEntityCfg("robot"),
             },
         ),
-        # Reset events
+        "randomize_joint_stiffness": EventTermCfg(
+            func=mdp.dr.joint_stiffness,
+            mode="startup",
+            params={
+                "ranges": (0.8, 1.2),
+                "operation": "scale",
+                "distribution": "log_uniform",
+                "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            },
+        ),
+        "randomize_joint_damping": EventTermCfg(
+            func=mdp.dr.joint_damping,
+            mode="startup",
+            params={
+                "ranges": (0.8, 1.2),
+                "operation": "scale",
+                "distribution": "log_uniform",
+                "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            },
+        ),
+        # Reset
         "reset_robot_base": EventTermCfg(
             func=mdp.reset_root_state_uniform,
             mode="reset",
@@ -251,164 +236,149 @@ def make_events() -> dict[str, EventTermCfg]:
                 "velocity_range": (-0.5, 0.5),
             },
         ),
-        "randomize_joint_stiffness": EventTermCfg(
-            func=mdp.dr.joint_stiffness,
+        # isaacgym: randomize_default_dof_pos ±0.05
+        "randomize_default_joint_pos": EventTermCfg(
+            func=mdp.randomize_default_joint_pos,
             mode="startup",
             params={
-                "ranges": (0.8, 1.2),
-                "operation": "scale",
-                "distribution": "log_uniform",
-                "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+                "offset_range": (-0.05, 0.05),
+                "asset_cfg": SceneEntityCfg("robot"),
             },
         ),
-        "randomize_joint_damping": EventTermCfg(
-            func=mdp.dr.joint_damping,
-            mode="startup",
-            params={
-                "ranges": (0.8, 1.2),
-                "operation": "scale",
-                "distribution": "log_uniform",
-                "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
-            },
-        ),
-        # Interval events
+        # Interval
         "push_robot": EventTermCfg(
             func=mdp.push_by_setting_velocity,
             mode="interval",
-            interval_range_s=(10.0, 15.0),
-            params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}}
+            interval_range_s=(7.0, 10.0),
+            params={"velocity_range": {"x": (-1.5, 1.5), "y": (-1.5, 1.5)}},
         ),
     }
 
 
 def make_rewards() -> dict[str, RewardTermCfg]:
-    """Create reward configurations."""
     return {
-        # safety
-        "safety_exp": RewardTermCfg(
-            func=mdp.safety_reward_exp,
+        # Balance
+        "keep_balance": RewardTermCfg(
+            func=mdp.keep_balance,
             weight=1.0,
-            params={"base_height_target": 0.9, "std": math.sqrt(0.5)}
         ),
-        # tasks
-        "track_base_position_exp": RewardTermCfg(
-            func=mdp.track_base_position_exp,
+        # Tracking
+        "tracking_lin_vel": RewardTermCfg(
+            func=mdp.tracking_lin_vel,
+            weight=4.0,
+            params={"std": 0.2, "command_name": "base_velocity"},
+        ),
+        "tracking_ang_vel": RewardTermCfg(
+            func=mdp.tracking_ang_vel,
             weight=2.0,
+            params={"std": 0.25, "command_name": "base_velocity"},
+        ),
+        "tracking_lin_vel_pb": RewardTermCfg(
+            func=mdp.tracking_lin_vel_pb,
+            weight=1.0,
+        ),
+        "tracking_ang_vel_pb": RewardTermCfg(
+            func=mdp.tracking_ang_vel_pb,
+            weight=0.2,
+        ),
+        # Regulation
+        "nominal_foot_position": RewardTermCfg(
+            func=mdp.nominal_foot_position,
+            weight=4.0,
             params={
-                "command_name": "base_pose",
-                "std": math.sqrt(0.5),
+                "base_height_target": 0.7664,
+                "std": 0.005,
+                "std_wrt_v": 0.5,
+                "command_name": "base_velocity",
             },
         ),
-        "track_base_orientation_exp": RewardTermCfg(
-            func=mdp.track_base_orientation_exp,
-            weight=3.0,
-            params={
-                "command_name": "base_pose",
-                "std": math.sqrt(0.5),
-            },
+        "leg_symmetry": RewardTermCfg(
+            func=mdp.leg_symmetry,
+            weight=0.5,
+            params={"std": 0.001},
         ),
-        "track_base_pb": RewardTermCfg(func=mdp.track_base_pb, weight=15.0),
-        "track_base_reference_exp": RewardTermCfg(
-            func=mdp.track_base_reference_exp,
-            weight=1.5,
-            params={"std": math.sqrt(0.5)},
+        "same_foot_x_position": RewardTermCfg(
+            func=mdp.same_foot_x_position,
+            weight=-50.0,
         ),
-        # penalties
-        "dof_weighted_torques_l2": RewardTermCfg(
+        "same_foot_z_position": RewardTermCfg(
+            func=mdp.same_foot_z_position,
+            weight=-100.0,
+        ),
+        "lin_vel_z": RewardTermCfg(
+            func=mdp.lin_vel_z,
+            weight=-0.3,
+        ),
+        "ang_vel_xy": RewardTermCfg(
+            func=mdp.ang_vel_xy,
+            weight=-0.3,
+        ),
+        "orientation": RewardTermCfg(
+            func=mdp.orientation_penalty,
+            weight=-12.0,
+        ),
+        "torques": RewardTermCfg(
             func=mdp.weighted_joint_torques_l2,
-            weight=-4.0e-5,
+            weight=-0.00016,
             params={
                 "torque_weight": {
-                    "abad_L_Joint": 0.2,
-                    "hip_L_Joint": 0.2,
-                    "knee_L_Joint": 0.2,
-                    "abad_R_Joint": 0.2,
-                    "hip_R_Joint": 0.2,
-                    "knee_R_Joint": 0.2,
-                    "wheel_L_Joint": 8.0,
-                    "wheel_R_Joint": 8.0,
+                    "abad_L_Joint": 1.0, "hip_L_Joint": 1.0, "knee_L_Joint": 1.0,
+                    "abad_R_Joint": 1.0, "hip_R_Joint": 1.0, "knee_R_Joint": 1.0,
+                    "wheel_L_Joint": 1.0, "wheel_R_Joint": 1.0,
                 }
             },
         ),
-        "dof_weighted_power_l1": RewardTermCfg(
-            func=mdp.weighted_joint_power_l1,
-            weight=-2.5e-4,
-            params={
-                "power_weight": {
-                    "abad_L_Joint": 1.0,
-                    "hip_L_Joint": 1.0,
-                    "knee_L_Joint": 1.0,
-                    # "foot_L_Joint": 1.0,
-                    "abad_R_Joint": 1.0,
-                    "hip_R_Joint": 1.0,
-                    "knee_R_Joint": 1.0,
-                    # "foot_R_Joint": 1.0,
-                    "wheel_L_Joint": 2.0,
-                    "wheel_R_Joint": 2.0,
-                }
-            },
+        "dof_acc": RewardTermCfg(
+            func=mdp.dof_acc,
+            weight=-1.5e-7,
         ),
-        "action_rate_l2": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.002),
-        "action_smoothness": RewardTermCfg(func=mdp.action_smoothness_penalty, weight=-0.006),
-        "dof_vel_wheel_l2": RewardTermCfg(
-            func=mdp.joint_vel_l2,
-            weight=-0.0005,
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names="wheel_.+")}
+        "action_rate": RewardTermCfg(
+            func=mdp.action_rate_l2,
+            weight=-0.03,
         ),
-        "dof_vel_non_wheel_l2": RewardTermCfg(
-            func=mdp.joint_vel_l2,
-            weight=-0.001,
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names="(?!wheel_).*")},
+        "action_smoothness": RewardTermCfg(
+            func=mdp.action_smoothness_penalty,
+            weight=-0.03,
         ),
-        "dof_non_wheel_pos_limits": RewardTermCfg(
+        "dof_pos_limits": RewardTermCfg(
             func=mdp.joint_pos_limits,
-            weight=-5.0,
+            weight=-2.0,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names="(?!wheel_).*")},
+        ),
+        "collision": RewardTermCfg(
+            func=mdp.collision_penalty,
+            weight=-50.0,
+            params={"threshold": 0.05},
+        ),
+        "feet_distance": RewardTermCfg(
+            func=mdp.feet_distance,
+            weight=-100.0,
+            params={"min_dist": 0.32, "max_dist": 0.35},
+        ),
+        "base_height": RewardTermCfg(
+            func=mdp.base_height_penalty,
+            weight=-20.0,
+            params={"target": 0.7664},
         ),
     }
 
 
 def make_terminations() -> dict[str, TerminationTermCfg]:
-    """Create termination configurations."""
     return {
         "time_out": TerminationTermCfg(func=mdp.time_out, time_out=True),
         "bad_orientation": TerminationTermCfg(
-            func=mdp.bad_orientation_stochastic,
-            params={
-                "limit_angle": math.pi * 0.4,
-                "probability": 0.1,
-            },  # Expect step = 1 / probability
+            func=mdp.bad_orientation_timer,
+            params={"limit_angle": math.pi * 0.4, "fail_time": 0.5},
         ),
         "bad_height": TerminationTermCfg(
-            func=mdp.bad_height_stochastic,
-            params={
-                "limit_height": 0.5,
-                "probability": 0.1,
-            },  # Expect step = 1 / probability
+            func=mdp.bad_height_timer,
+            params={"limit_height": 0.5, "fail_time": 0.5},
         ),
     }
 
 
 def make_curriculum() -> dict[str, CurriculumTermCfg]:
-    """Create curriculum configurations."""
-    return {
-        "pos_commands_ranges_level": CurriculumTermCfg(
-            func=mdp.pos_commands_ranges_level,
-            params={
-                "max_range": mdp.UniformWorldPoseCommandCfg.Ranges(
-                    # pos lin
-                    pos_x=(-2.0, 2.0),
-                    pos_y=(-2.0, 2.0),
-                    # vel
-                    vel_x=(-1.0, 1.0),
-                    vel_y=(-1.0, 1.0),
-                    vel_yaw=(-2.0, 2.0),
-                ),
-                "update_interval": 80 * 24,  # 80 iterations * 24 steps per iteration
-                "command_name": "base_pose",
-            },
-        )
-    }
+    return {}
 
 
 SIM_CFG = SimulationCfg(
@@ -423,7 +393,6 @@ SIM_CFG = SimulationCfg(
 
 
 def make_wf_tron_env_cfg() -> ManagerBasedRlEnvCfg:
-    """Factory function to create WF-TRON environment configuration for training."""
     return ManagerBasedRlEnvCfg(
         scene=SCENE_CFG,
         observations=make_observations(),
@@ -442,10 +411,7 @@ def make_wf_tron_env_cfg() -> ManagerBasedRlEnvCfg:
 
 
 def make_wf_tron_play_env_cfg() -> ManagerBasedRlEnvCfg:
-    """Factory function to create WF-TRON environment configuration for play."""
     env_cfg = deepcopy(make_wf_tron_env_cfg())
     env_cfg.scene.num_envs = 4
-    env_cfg.commands["base_pose"].ranges = deepcopy(
-        env_cfg.curriculum["pos_commands_ranges_level"].params["max_range"]
-    )
+    env_cfg.scene.terrain = PLANE_ENTITY_CFG
     return env_cfg
