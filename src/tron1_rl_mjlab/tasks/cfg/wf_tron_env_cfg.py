@@ -333,7 +333,7 @@ def make_rewards() -> dict[str, RewardTermCfg]:
             weight=-1.5e-7,
         ),
         "action_rate": RewardTermCfg(
-            func=mdp.action_rate_l2,
+            func=mdp.action_rate,
             weight=-0.03,
         ),
         "action_smoothness": RewardTermCfg(
@@ -341,7 +341,7 @@ def make_rewards() -> dict[str, RewardTermCfg]:
             weight=-0.03,
         ),
         "dof_pos_limits": RewardTermCfg(
-            func=mdp.joint_pos_limits,
+            func=mdp.dof_pos_limits,
             weight=-2.0,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names="(?!wheel_).*")},
         ),

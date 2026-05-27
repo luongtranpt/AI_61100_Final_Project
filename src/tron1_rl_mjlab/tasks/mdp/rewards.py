@@ -7,6 +7,8 @@ import torch
 from mjlab.entity import Entity
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.utils.lab_api.math import quat_apply_inverse
+from mjlab.envs.mdp import action_rate_l2 as _action_rate_l2
+from mjlab.envs.mdp import joint_pos_limits as _joint_pos_limits
 
 from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
 
@@ -143,7 +145,7 @@ def lin_vel_z(
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     asset: Entity = env.scene[asset_cfg.name]
-    return torch.square(asset.data.root_link_lin_vel_b[:, 2])
+    return torch.square(asset.data.root_link_lin_vel_b[:, 2]).clamp(0.0, 5.0 / 0.3)
 
 
 def ang_vel_xy(
@@ -245,4 +247,17 @@ def action_smoothness_penalty(env: ManagerBasedRlEnv) -> torch.Tensor:
     env._smooth_prev_prev = env._smooth_prev  # type: ignore
     env._smooth_prev = current  # type: ignore
     penalty[env.episode_length_buf < 3] = 0
-    return penalty
+    return penalty.clamp(0.0, 5.0 / 0.03)
+
+
+def action_rate(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Clipped wrapper around mjlab action_rate_l2 (weight=-0.03 → max=166.67)."""
+    return _action_rate_l2(env).clamp(0.0, 5.0 / 0.03)
+
+
+def dof_pos_limits(
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Clipped wrapper around mjlab joint_pos_limits (weight=-2.0 → max=2.5)."""
+    return _joint_pos_limits(env, asset_cfg=asset_cfg).clamp(0.0, 5.0 / 2.0)
