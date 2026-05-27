@@ -65,6 +65,8 @@ class PPO:
         grad_penalty_coef_schedule: list | None = None,
         # Reward clipping (matches isaacgym clip_reward)
         clip_reward: float | None = 100.0,
+        # 2-phase training: freeze teacher after this many iters, then train student
+        teacher_phase_iters: int = 0,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
@@ -120,6 +122,7 @@ class PPO:
         self.num_proprio_encoder_substeps = num_proprio_encoder_substeps
         self.grad_penalty_coef_schedule = grad_penalty_coef_schedule
         self.clip_reward = clip_reward
+        self.teacher_phase_iters = teacher_phase_iters
         self.counter = 0
 
         # PPO components
@@ -143,11 +146,13 @@ class PPO:
                 self.optimizer = resolve_optimizer(optimizer)(
                     chain(actor_main_params, self.critic.parameters()), lr=learning_rate
                 )  # type: ignore
-                # Extra optimizer: proprioceptive encoder only
+                # Extra optimizer: proprioceptive encoder + student MLP
                 if self.actor.proprioceptive_encoder is not None:
-                    self.extra_optimizer = optim.Adam(
-                        self.actor.proprioceptive_encoder.parameters(), lr=1e-3
+                    student_params = chain(
+                        self.actor.proprioceptive_encoder.parameters(),
+                        self.actor.student_mlp.parameters(),
                     )
+                    self.extra_optimizer = optim.Adam(student_params, lr=1e-3)
             else:
                 # Student-reinforcing mode: exclude privileged encoder from main optimizer
                 actor_main_params = [
@@ -258,6 +263,8 @@ class PPO:
         mean_gradient_penalty = 0.0
         mean_proprio_extra_loss = 0.0
         mean_teacher_student_mse = 0.0
+        mean_encoder_distill_loss = 0.0
+        mean_action_distill_loss = 0.0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -276,8 +283,45 @@ class PPO:
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
+        # 2-phase: phase 1 = RL teacher only, phase 2 = distillation student only
+        in_student_phase = self.teacher_phase_iters > 0 and self.counter >= self.teacher_phase_iters
+
         # Iterate over batches
         for batch in generator:
+            # ── Phase 2: distillation only, skip RL ──────────────────────────
+            if in_student_phase:
+                if self.extra_optimizer is not None:
+                    for _ in range(self.num_proprio_encoder_substeps):
+                        # Encoder distillation: proprio_latent → teacher_latent
+                        proprio_latent = self.actor.proprio_encode(batch.observations)  # type: ignore[attr-defined]
+                        with torch.no_grad():
+                            teacher_latent = self.actor.privileged_encode(batch.observations)  # type: ignore[attr-defined]
+                        encoder_distill_loss = F.mse_loss(proprio_latent, teacher_latent)
+
+                        # Action distillation: student_act → teacher_act
+                        student_act = self.actor.act_inference_student(batch.observations)  # type: ignore[attr-defined]
+                        with torch.no_grad():
+                            teacher_act = self.actor.act_inference_teacher(batch.observations)  # type: ignore[attr-defined]
+                        action_distill_loss = F.mse_loss(student_act, teacher_act)
+
+                        distill_loss = encoder_distill_loss + action_distill_loss
+                        self.extra_optimizer.zero_grad()
+                        distill_loss.backward()
+                        nn.utils.clip_grad_norm_(
+                            chain(
+                                self.actor.proprioceptive_encoder.parameters(),  # type: ignore[union-attr]
+                                self.actor.student_mlp.parameters(),  # type: ignore[attr-defined]
+                            ),
+                            self.max_grad_norm,
+                        )
+                        self.extra_optimizer.step()
+                        mean_proprio_extra_loss += distill_loss.item()
+                        mean_encoder_distill_loss += encoder_distill_loss.item()
+                        mean_action_distill_loss += action_distill_loss.item()
+                mean_teacher_student_mse += mean_proprio_extra_loss / max(self.num_proprio_encoder_substeps, 1)
+                continue
+            # ─────────────────────────────────────────────────────────────────
+
             original_batch_size = batch.observations.batch_size[0]
 
             # Check if we should normalize advantages per mini batch
@@ -454,7 +498,8 @@ class PPO:
                 self.rnd_optimizer.step()
 
             # Extra gradient step: distill privileged latent into proprioceptive encoder
-            if self.extra_optimizer is not None:
+            # Only in simultaneous mode (teacher_phase_iters == 0); 2-phase mode handles above.
+            if self.extra_optimizer is not None and self.teacher_phase_iters == 0:
                 for _ in range(self.num_proprio_encoder_substeps):
                     proprio_latent = self.actor.proprio_encode(batch.observations)  # type: ignore[attr-defined]
                     privileged_latent = self.actor.privileged_encode(batch.observations).detach()  # type: ignore[attr-defined]
@@ -495,6 +540,8 @@ class PPO:
         num_updates_extra = num_updates * self.num_proprio_encoder_substeps
         if num_updates_extra > 0 and self.extra_optimizer is not None:
             mean_proprio_extra_loss /= num_updates_extra
+            mean_encoder_distill_loss /= num_updates_extra
+            mean_action_distill_loss /= num_updates_extra
         mean_teacher_student_mse /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
@@ -514,6 +561,8 @@ class PPO:
             "gradient_penalty_coef": gradient_penalty_coef,
             "proprio_extra": mean_proprio_extra_loss,
             "teacher_student_mse": mean_teacher_student_mse,
+            "encoder_distill": mean_encoder_distill_loss,
+            "action_distill": mean_action_distill_loss,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss

@@ -48,6 +48,8 @@ class RslRlTSPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     Set to None to disable the penalty."""
     clip_reward: Optional[float] = 100.0
     """Clip total reward per step to [-clip_reward, clip_reward]. Matches isaacgym clip_reward."""
+    teacher_phase_iters: int = 3000
+    """Train teacher (privileged encoder + MLP) for this many iters, then freeze and train student."""
 
 
 def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
@@ -89,5 +91,6 @@ def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
             max_grad_norm=1.0,
             num_proprio_encoder_substeps=1,
             grad_penalty_coef_schedule=[0.002, 0.002, 0, 1],
+            teacher_phase_iters=3000,
         ),
     )

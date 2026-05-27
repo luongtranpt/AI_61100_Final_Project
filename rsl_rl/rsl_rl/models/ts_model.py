@@ -150,10 +150,14 @@ class TSModel(nn.Module):
         if self.distribution is not None:
             self.distribution.init_mlp_weights(self.mlp)
 
+        # Student MLP — separate copy, trained by action distillation in phase 2
+        self.student_mlp = copy.deepcopy(self.mlp)
+
         print(f"PrivilegedEncoder: {self.privileged_encoder}")
         if self.proprioceptive_encoder is not None:
             print(f"ProprioceptiveEncoder: {self.proprioceptive_encoder}")
-        print(f"MLP: {self.mlp}")
+        print(f"Teacher MLP: {self.mlp}")
+        print(f"Student MLP: {self.student_mlp}")
 
     # ------------------------------------------------------------------ #
     # MLPModel-compatible interface                                         #
@@ -167,7 +171,7 @@ class TSModel(nn.Module):
         stochastic_output: bool = False,
     ) -> torch.Tensor:
         latent = self.get_latent(obs, masks, hidden_state)
-        mlp_output = self.mlp(latent)
+        mlp_output = self.student_mlp(latent) if self._student_mode else self.mlp(latent)
         if self.distribution is not None:
             if stochastic_output:
                 self.distribution.update(mlp_output)
@@ -290,7 +294,7 @@ class _TorchTSStudentModel(nn.Module):
         if model.proprioceptive_encoder is None:
             raise ValueError("Cannot export student model: history_obs_key was set to None.")
         self.proprio_encoder = copy.deepcopy(model.proprioceptive_encoder)
-        self.mlp = copy.deepcopy(model.mlp)
+        self.mlp = copy.deepcopy(model.student_mlp)
         if model.distribution is not None:
             self.deterministic_output: nn.Module = model.distribution.as_deterministic_output_module()
         else:
@@ -323,7 +327,7 @@ class _OnnxTSStudentModel(nn.Module):
             raise ValueError("Cannot export student model: history_obs_key was set to None.")
         self.verbose = verbose
         self.proprio_encoder = copy.deepcopy(model.proprioceptive_encoder)
-        self.mlp = copy.deepcopy(model.mlp)
+        self.mlp = copy.deepcopy(model.student_mlp)
         if model.distribution is not None:
             self.deterministic_output: nn.Module = model.distribution.as_deterministic_output_module()
         else:
