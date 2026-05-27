@@ -135,12 +135,38 @@ class OnPolicyRunner:
 
     def save(self, path: str, infos: dict | None = None) -> None:
         """Save the models and training state to a given path and upload them if external logging is used."""
+        import os
         saved_dict = self.alg.save()
         saved_dict["iter"] = self.current_learning_iteration
         saved_dict["infos"] = infos
         torch.save(saved_dict, path)
         # Upload model to external logging services
         self.logger.save_model(path, self.current_learning_iteration)
+
+        # For TSModel: save teacher and student separately for easy retraining
+        from rsl_rl.models.ts_model import TSModel
+        actor = self.alg.actor
+        if isinstance(actor, TSModel):
+            base = os.path.splitext(path)[0]  # strip .pt
+            # Teacher: privileged_encoder + teacher_mlp
+            torch.save(
+                {
+                    "iter": self.current_learning_iteration,
+                    "privileged_encoder": actor.privileged_encoder.state_dict(),
+                    "mlp": actor.mlp.state_dict(),
+                },
+                base + "_teacher.pt",
+            )
+            # Student: proprioceptive_encoder + student_mlp
+            if actor.proprioceptive_encoder is not None:
+                torch.save(
+                    {
+                        "iter": self.current_learning_iteration,
+                        "proprioceptive_encoder": actor.proprioceptive_encoder.state_dict(),
+                        "student_mlp": actor.student_mlp.state_dict(),
+                    },
+                    base + "_student.pt",
+                )
 
     def load(
         self, path: str, load_cfg: dict | None = None, strict: bool = True, map_location: str | None = None
