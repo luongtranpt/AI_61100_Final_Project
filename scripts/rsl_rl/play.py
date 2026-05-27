@@ -41,6 +41,8 @@ class PlayConfig:
     """Disable all termination conditions (useful for viewing motions with dummy agents)."""
     export_onnx: bool = False
     """Export the student policy as an ONNX file to the checkpoint directory, then exit."""
+    deploy_mode: Literal["teacher", "student"] = "student"
+    """Which encoder to use for deployment: 'teacher' (privileged, needs critic obs) or 'student' (history)."""
 
     # Internal flag used by demo script.
     _demo_mode: tyro.conf.Suppress[bool] = False
@@ -241,7 +243,17 @@ def run_play(task_id: str, cfg: PlayConfig):
             assert log_dir is not None
             runner.export_policy_to_onnx(str(log_dir), "policy.onnx")
             print(f"[INFO]: Exported student policy to {log_dir / 'policy.onnx'}")
-        policy = runner.get_inference_policy_student(device=device)
+        if cfg.deploy_mode == "teacher":
+            print("[INFO]: Deploying with TEACHER encoder (privileged obs)")
+            policy = runner.get_inference_policy(device=device)
+            # Switch actor to teacher mode (uses privileged_encoder)
+            actor = runner.alg.actor
+            from rsl_rl.models.ts_model import TSModel
+            if isinstance(actor, TSModel):
+                actor.use_teacher_mode()
+        else:
+            print("[INFO]: Deploying with STUDENT encoder (obs history)")
+            policy = runner.get_inference_policy_student(device=device)
 
     # Handle "auto" viewer selection.
     if cfg.viewer == "auto":

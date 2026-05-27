@@ -252,6 +252,7 @@ class PPO:
         mean_entropy = 0
         mean_gradient_penalty = 0.0
         mean_proprio_extra_loss = 0.0
+        mean_teacher_student_mse = 0.0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -461,6 +462,14 @@ class PPO:
                     self.extra_optimizer.step()
                     mean_proprio_extra_loss += proprio_extra_loss.item()
 
+            # Teacher vs student action MSE — measures deploy gap (no gradient)
+            from rsl_rl.models.ts_model import TSModel
+            if isinstance(self.actor, TSModel) and self.actor.proprioceptive_encoder is not None:
+                with torch.inference_mode():
+                    teacher_act = self.actor.act_inference_teacher(batch.observations)
+                    student_act = self.actor.act_inference_student(batch.observations)
+                    mean_teacher_student_mse += F.mse_loss(teacher_act, student_act).item()
+
             # Store the losses
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
@@ -481,6 +490,7 @@ class PPO:
         num_updates_extra = num_updates * self.num_proprio_encoder_substeps
         if num_updates_extra > 0 and self.extra_optimizer is not None:
             mean_proprio_extra_loss /= num_updates_extra
+        mean_teacher_student_mse /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
@@ -498,6 +508,7 @@ class PPO:
             "gradient_penalty": mean_gradient_penalty,
             "gradient_penalty_coef": gradient_penalty_coef,
             "proprio_extra": mean_proprio_extra_loss,
+            "teacher_student_mse": mean_teacher_student_mse,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
