@@ -150,8 +150,8 @@ class TSModel(nn.Module):
         if self.distribution is not None:
             self.distribution.init_mlp_weights(self.mlp)
 
-        # Student MLP — separate copy, trained by action distillation in phase 2
-        self.student_mlp = copy.deepcopy(self.mlp)
+        # Student MLP — fresh init, trained from scratch by distillation in phase 2
+        self.student_mlp = MLP(mlp_input_dim, mlp_output_dim, hidden_dims, activation)
 
         print(f"PrivilegedEncoder: {self.privileged_encoder}")
         if self.proprioceptive_encoder is not None:
