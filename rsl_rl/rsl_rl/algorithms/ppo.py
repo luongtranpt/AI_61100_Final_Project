@@ -183,6 +183,10 @@ class PPO:
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
+        # Phase 2: student acts in env so rollout is on-policy for student (pointfoot style)
+        from rsl_rl.models.ts_model import TSModel
+        if isinstance(self.actor, TSModel) and self.teacher_phase_iters > 0 and self.counter >= self.teacher_phase_iters:
+            self.actor.use_student_mode()
         # Record the hidden states for recurrent policies
         self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
         # Compute the actions and values
@@ -277,50 +281,66 @@ class PPO:
             stage = min(max((self.counter - s_begin_step), 0) / max(s_duration, 1), 1.0)
             gradient_penalty_coef = stage * (s_end - s_start) + s_start
 
+        # 2-phase: phase 1 = RL teacher only, phase 2 = distillation student only
+        in_student_phase = self.teacher_phase_iters > 0 and self.counter >= self.teacher_phase_iters
+
+        # ── Phase 2: pointfoot-style distillation ─────────────────────────────────────
+        # Full buffer → 1 gradient step → L2 norm loss (no epochs/mini-batches)
+        if in_student_phase:
+            mean_encoder_distill_loss = 0.0
+            mean_action_distill_loss = 0.0
+            mean_teacher_student_mse = 0.0
+            if self.extra_optimizer is not None:
+                # All transitions in one batch (pointfoot: no mini-batch, no epoch loop)
+                batch = next(self.storage.mini_batch_generator(1, 1))
+
+                # Student forward WITH gradients
+                student_latent = self.actor.proprio_encode(batch.observations)  # type: ignore[attr-defined]
+                student_act = self.actor.act_inference_student(batch.observations)  # type: ignore[attr-defined]
+                # Teacher forward frozen
+                with torch.no_grad():
+                    teacher_latent = self.actor.privileged_encode(batch.observations)  # type: ignore[attr-defined]
+                    teacher_act = self.actor.act_inference_teacher(batch.observations)  # type: ignore[attr-defined]
+
+                # L2 norm per sample then mean (pointfoot style, not MSE)
+                encoder_loss = (teacher_latent.detach() - student_latent).norm(p=2, dim=1).mean()
+                actor_loss = (teacher_act.detach() - student_act).norm(p=2, dim=1).mean()
+                distill_loss = encoder_loss + actor_loss
+
+                self.extra_optimizer.zero_grad()
+                distill_loss.backward()
+                nn.utils.clip_grad_norm_(
+                    chain(
+                        self.actor.proprioceptive_encoder.parameters(),  # type: ignore[union-attr]
+                        self.actor.student_mlp.parameters(),  # type: ignore[attr-defined]
+                    ),
+                    self.max_grad_norm,
+                )
+                self.extra_optimizer.step()
+
+                mean_encoder_distill_loss = encoder_loss.item()
+                mean_action_distill_loss = actor_loss.item()
+                mean_teacher_student_mse = distill_loss.item()
+
+            self.storage.clear()
+            self.update_counter()
+            return {
+                "value": 0.0, "surrogate": 0.0, "entropy": 0.0,
+                "gradient_penalty": 0.0, "gradient_penalty_coef": 0.0,
+                "proprio_extra": 0.0, "teacher_student_mse": mean_teacher_student_mse,
+                "encoder_distill": mean_encoder_distill_loss,
+                "action_distill": mean_action_distill_loss,
+            }
+        # ──────────────────────────────────────────────────────────────────────────────
+
         # Get mini batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
-        # 2-phase: phase 1 = RL teacher only, phase 2 = distillation student only
-        in_student_phase = self.teacher_phase_iters > 0 and self.counter >= self.teacher_phase_iters
-
         # Iterate over batches
         for batch in generator:
-            # ── Phase 2: distillation only, skip RL ──────────────────────────
-            if in_student_phase:
-                if self.extra_optimizer is not None:
-                    for _ in range(self.num_proprio_encoder_substeps):
-                        # Encoder distillation: proprio_latent → teacher_latent
-                        proprio_latent = self.actor.proprio_encode(batch.observations)  # type: ignore[attr-defined]
-                        with torch.no_grad():
-                            teacher_latent = self.actor.privileged_encode(batch.observations)  # type: ignore[attr-defined]
-                        encoder_distill_loss = F.mse_loss(proprio_latent, teacher_latent)
-
-                        # Action distillation: student_act → teacher_act
-                        student_act = self.actor.act_inference_student(batch.observations)  # type: ignore[attr-defined]
-                        with torch.no_grad():
-                            teacher_act = self.actor.act_inference_teacher(batch.observations)  # type: ignore[attr-defined]
-                        action_distill_loss = F.mse_loss(student_act, teacher_act)
-
-                        distill_loss = encoder_distill_loss + action_distill_loss
-                        self.extra_optimizer.zero_grad()
-                        distill_loss.backward()
-                        nn.utils.clip_grad_norm_(
-                            chain(
-                                self.actor.proprioceptive_encoder.parameters(),  # type: ignore[union-attr]
-                                self.actor.student_mlp.parameters(),  # type: ignore[attr-defined]
-                            ),
-                            self.max_grad_norm,
-                        )
-                        self.extra_optimizer.step()
-                        mean_proprio_extra_loss += distill_loss.item()
-                        mean_encoder_distill_loss += encoder_distill_loss.item()
-                        mean_action_distill_loss += action_distill_loss.item()
-                mean_teacher_student_mse += mean_proprio_extra_loss / max(self.num_proprio_encoder_substeps, 1)
-                continue
-            # ─────────────────────────────────────────────────────────────────
 
             original_batch_size = batch.observations.batch_size[0]
 
