@@ -107,6 +107,9 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     env = ManagerBasedRlEnv(
         cfg=cfg.env, device=device, render_mode="rgb_array" if cfg.video else None
     )
+    # Disable CUDA graph for raycast sensor — graph capture is incompatible
+    # with the mjwarp sense kernel and causes "Graph creation error"
+    env.sim.sense_graph = None
 
     log_root_path = log_dir.parent  # Go up from specific run dir to experiment dir.
 

@@ -11,6 +11,7 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.scene import SceneCfg
+from mjlab.sensor import GridPatternCfg, ObjRef, RayCastSensorCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.utils.noise import GaussianNoiseCfg
 from mjlab.viewer import ViewerConfig
@@ -19,11 +20,22 @@ from ...assets.wf_tron.wf_tron import WF_TRON_ROBOT_CFG
 from .terrain_cfg import TERRAINS_ENTITY_CFG, PLANE_ENTITY_CFG
 from .. import mdp
 
+# 13×9 = 117 rays — matches isaacgym num_height_samples=117
+TERRAIN_SCAN_CFG = RayCastSensorCfg(
+    name="terrain_scan",
+    frame=ObjRef(type="body", name="base_Link", entity="robot"),
+    ray_alignment="yaw",
+    pattern=GridPatternCfg(size=(1.2, 0.8), resolution=0.1),
+    max_distance=5.0,
+    exclude_parent_body=True,
+)
+
 SCENE_CFG = SceneCfg(
     num_envs=4096,
     extent=1.0,
-    terrain=PLANE_ENTITY_CFG,
+    terrain=TERRAINS_ENTITY_CFG,
     entities={"robot": WF_TRON_ROBOT_CFG},
+    sensors=(TERRAIN_SCAN_CFG,),
 )
 
 VIEWER_CONFIG = ViewerConfig(
@@ -70,23 +82,28 @@ def make_actions() -> dict[str, ActionTermCfg]:
 
 def make_observations() -> dict[str, ObservationGroupCfg]:
     # Commands (3 dims: scaled vel)
+    # scale done inside function → clip on already-scaled output → ±4
     commands_terms = {
         "base_vel_commands": ObservationTermCfg(
             func=mdp.base_vel_commands,
             params={"command_name": "base_velocity"},
+            clip=(-4.0, 4.0),
         ),
     }
 
     # Policy obs — matches isaacgym obs_buf (28 dims) + commands (3) = 31 total
+    # clip is applied BEFORE scale, so clip=(raw_min, raw_max) → scaled output in [raw_min*scale, raw_max*scale]
     policy_terms = {
         "base_ang_vel": ObservationTermCfg(
             func=mdp.base_ang_vel,
             noise=GaussianNoiseCfg(mean=0.0, std=0.3),
+            clip=(-20.0, 20.0),   # *0.25 → ±5 scaled
             scale=0.25,
         ),
         "proj_gravity": ObservationTermCfg(
             func=mdp.projected_gravity,
             noise=GaussianNoiseCfg(mean=0.0, std=0.075),
+            clip=(-1.0, 1.0),     # unit vector, naturally in [-1, 1]
             scale=1.0,
         ),
         "joint_pos": ObservationTermCfg(
@@ -96,23 +113,37 @@ def make_observations() -> dict[str, ObservationGroupCfg]:
                 joint_names=("abad_[RL]_Joint", "hip_[RL]_Joint", "knee_[RL]_Joint"),
             )},
             noise=GaussianNoiseCfg(mean=0.0, std=0.015),
+            clip=(-5.0, 5.0),     # rad from default, *1.0 → ±5 scaled
             scale=1.0,
         ),
         "joint_vel": ObservationTermCfg(
             func=mdp.joint_vel_rel,
             noise=GaussianNoiseCfg(mean=0.0, std=2.25),
+            clip=(-100.0, 100.0), # rad/s, *0.05 → ±5 scaled
             scale=0.05,
         ),
         "last_action": ObservationTermCfg(
             func=mdp.last_action,
             noise=GaussianNoiseCfg(mean=0.0, std=0.01),
+            clip=(-5.0, 5.0),     # action space, *1.0 → ±5 scaled
             scale=1.0,
         ),
     }
 
-    # Critic gets base_lin_vel (privileged) + commands + policy
+    # Critic gets base_lin_vel + height_scan (privileged) + commands + policy
+    # height_scan is critic-only: teacher encoder + critic see terrain, student stays blind
     critic_extra = {
-        "base_lin_vel": ObservationTermCfg(func=mdp.base_lin_vel, scale=2.0),
+        "base_lin_vel": ObservationTermCfg(
+            func=mdp.base_lin_vel,
+            clip=(-5.0, 5.0),     # m/s, *2.0 → ±10 scaled
+            scale=2.0,
+        ),
+        "height_scan": ObservationTermCfg(
+            func=mdp.height_scan,
+            params={"sensor_name": "terrain_scan", "offset": 0.5},
+            clip=(-1.0, 1.0),     # matches isaacgym clip before *5.0
+            scale=5.0,            # matches isaacgym obs_scales.height_measurements=5.0
+        ),
     }
 
     return {
@@ -378,7 +409,12 @@ def make_terminations() -> dict[str, TerminationTermCfg]:
 
 
 def make_curriculum() -> dict[str, CurriculumTermCfg]:
-    return {}
+    return {
+        "terrain_levels": CurriculumTermCfg(
+            func=mdp.terrain_levels_vel,
+            params={"command_name": "base_velocity"},
+        ),
+    }
 
 
 SIM_CFG = SimulationCfg(

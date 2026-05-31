@@ -62,7 +62,10 @@ class OnPolicyRunner:
             )
 
         # Start learning
+        clip_obs = self.cfg.get("clip_obs", 100.0)
         obs = self.env.get_observations().to(self.device)
+        if clip_obs is not None:
+            obs = obs.apply(lambda t: t.clamp(-clip_obs, clip_obs))
         self.alg.train_mode()  # switch to train mode (for dropout for example)
 
         # Ensure all parameters are in-synced
@@ -85,11 +88,17 @@ class OnPolicyRunner:
                     actions = self.alg.act(obs)
                     # Step the environment
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    # Replace NaN obs/rewards with 0 to prevent training collapse
+                    obs = obs.apply(lambda t: torch.nan_to_num(t, nan=0.0))
+                    rewards = torch.nan_to_num(rewards, nan=0.0)
                     # Check for NaN values from the environment
                     if self.cfg.get("check_for_nan", True):
                         check_nan(obs, rewards, dones)
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    # Clip observations to [-clip_obs, clip_obs] (matches isaacgym clip_observations=100)
+                    if clip_obs is not None:
+                        obs = obs.apply(lambda t: t.clamp(-clip_obs, clip_obs))
                     # Process the step
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     # Extract intrinsic rewards if RND is used (only for logging)

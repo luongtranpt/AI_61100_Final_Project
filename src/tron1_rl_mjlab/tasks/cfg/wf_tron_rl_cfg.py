@@ -56,7 +56,7 @@ def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
     """Create RL runner configuration for WF-TRON task."""
     return RslRlOnPolicyRunnerCfg(
         num_steps_per_env=24,
-        max_iterations=15000,
+        max_iterations=1500000,
         save_interval=200,
         wandb_project="mjlab_wf_tron",
         experiment_name="wf_tron",
@@ -65,7 +65,7 @@ def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
             hidden_dims=(512, 256, 128),
             activation="elu",
             encoder_hidden_dims=(256, 128),
-            encoder_latent_dim=3,
+            encoder_latent_dim=16,
             distribution_cfg={
                 "class_name": "rsl_rl.modules:GaussianDistribution",
                 "init_std": 1.0,
@@ -91,6 +91,6 @@ def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
             max_grad_norm=1.0,
             num_proprio_encoder_substeps=1,
             grad_penalty_coef_schedule=[0.002, 0.002, 0, 1],
-            teacher_phase_iters=3000,
+            teacher_phase_iters=8000,
         ),
     )

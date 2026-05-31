@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from mjlab.entity import Entity
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 from .commands import UniformWorldPoseCommandCfg
@@ -11,6 +12,35 @@ from .commands import UniformWorldPoseCommandCfg
 from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
+
+
+def terrain_levels_vel(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Terrain curriculum: level up/down based on distance walked.
+
+    Safe on plane terrain — returns 0.0 if no terrain generator is present.
+    """
+    terrain = env.scene.terrain
+    if terrain is None or terrain.cfg.terrain_generator is None:
+        return torch.zeros(1)
+
+    asset: Entity = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+
+    distance = torch.norm(
+        asset.data.root_link_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1
+    )
+    terrain_size = terrain.cfg.terrain_generator.size
+    move_up = distance > terrain_size[0] / 2
+    move_down = distance < torch.norm(command[env_ids, :2], dim=1) * env.max_episode_length_s * 0.5
+    move_down *= ~move_up
+
+    terrain.update_env_origins(env_ids, move_up, move_down)
+    return torch.mean(terrain.terrain_levels.float())
 
 
 def pos_commands_ranges_level(

@@ -189,6 +189,7 @@ class TSModel(nn.Module):
             encoder_latent = self.proprioceptive_encoder(obs[self.history_obs_key])
         else:
             encoder_latent = self.privileged_encoder(obs[self.privileged_obs_key])
+        encoder_latent = encoder_latent.clamp(-50.0, 50.0)
         parts = [encoder_latent, obs[self.raw_obs_key]]
         if self.commands_key is not None:
             parts.append(obs[self.commands_key])
