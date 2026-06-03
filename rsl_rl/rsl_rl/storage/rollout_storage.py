@@ -52,6 +52,9 @@ class RolloutStorage:
             self.distribution_params: tuple[torch.Tensor, ...] | None = None
             """Parameters of the action distribution (RL only)."""
 
+            self.teacher_mask: torch.Tensor | None = None
+            """Bool mask: True for teacher-group envs, False for student-group (CTS only)."""
+
             # For distillation
             self.privileged_actions: torch.Tensor | None = None
             """Privileged (teacher) actions (distillation only)."""
@@ -84,6 +87,7 @@ class RolloutStorage:
             masks: torch.Tensor | None = None,
             privileged_actions: torch.Tensor | None = None,
             dones: torch.Tensor | None = None,
+            teacher_mask: torch.Tensor | None = None,
         ) -> None:
             """Initialize a batch container over rollout data."""
             self.observations: TensorDict | None = observations
@@ -122,6 +126,9 @@ class RolloutStorage:
             self.masks: torch.Tensor | None = masks
             """Batch of trajectory masks for recurrent networks (RL recurrent only)."""
 
+            self.teacher_mask: torch.Tensor | None = teacher_mask
+            """Bool mask: True for teacher-group samples (CTS only)."""
+
     def __init__(
         self,
         training_type: str,
@@ -159,6 +166,7 @@ class RolloutStorage:
             self.distribution_params: tuple[torch.Tensor, ...] | None = None  # Lazily initialized on first transition
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.teacher_mask_buf = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device, dtype=torch.bool)
 
         # For recurrent networks
         self.saved_hidden_state_a = None
@@ -194,6 +202,8 @@ class RolloutStorage:
                 )
             for i, p in enumerate(transition.distribution_params):  # type: ignore
                 self.distribution_params[i][self.step].copy_(p)
+            if transition.teacher_mask is not None:
+                self.teacher_mask_buf[self.step].copy_(transition.teacher_mask.view(-1, 1))
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -235,6 +245,7 @@ class RolloutStorage:
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
         advantages = self.advantages.flatten(0, 1)
         old_distribution_params = tuple(p.flatten(0, 1) for p in self.distribution_params)  # type: ignore
+        teacher_mask_flat = self.teacher_mask_buf.flatten(0, 1)
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -252,7 +263,37 @@ class RolloutStorage:
                     returns=returns[batch_idx],
                     old_actions_log_prob=old_actions_log_prob[batch_idx],
                     old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
+                    teacher_mask=teacher_mask_flat[batch_idx],
                 )
+
+    # For CTS supervised update — student envs only (Algorithm 1 lines 10-12)
+    def student_mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator[Batch, None, None]:
+        """Yield mini-batches from student-group envs only (CTS supervised reconstruction update)."""
+        if self.training_type != "rl":
+            raise ValueError("This function is only available for reinforcement learning training.")
+
+        # Identify student envs: teacher_mask_buf == False (fixed across all steps)
+        student_env_mask = ~self.teacher_mask_buf[0].squeeze(-1)  # [num_envs] bool
+        student_env_ids = student_env_mask.nonzero(as_tuple=True)[0]
+        n_student = len(student_env_ids)
+        if n_student == 0:
+            return
+
+        batch_size = self.num_transitions_per_env * n_student
+        mini_batch_size = batch_size // num_mini_batches
+        if mini_batch_size == 0:
+            return
+        indices = torch.randperm(mini_batch_size * num_mini_batches, requires_grad=False, device=self.device)
+
+        # Only observations are needed for the supervised reconstruction loss
+        observations = self.observations[:, student_env_ids].flatten(0, 1)
+
+        for epoch in range(num_epochs):
+            for i in range(num_mini_batches):
+                start = i * mini_batch_size
+                stop = (i + 1) * mini_batch_size
+                batch_idx = indices[start:stop]
+                yield RolloutStorage.Batch(observations=observations[batch_idx])  # type: ignore
 
     # For reinforcement learning with recurrent networks
     def recurrent_mini_batch_generator(

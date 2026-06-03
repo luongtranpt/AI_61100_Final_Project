@@ -11,6 +11,7 @@ import copy
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tensordict import TensorDict
 
 from rsl_rl.modules import MLP, HiddenState
@@ -142,7 +143,8 @@ class TSModel(nn.Module):
             self.distribution = None
             mlp_output_dim = output_dim
 
-        # MLP head: input is (encoder_latent_dim + raw_obs_dim + commands_dim)
+        # Shared policy MLP: input is (encoder_latent_dim + raw_obs_dim + commands_dim)
+        # Used by BOTH teacher (privileged encoder) and student (proprio encoder) — CTS paper Fig.2
         mlp_input_dim = encoder_latent_dim + raw_obs_dim + commands_dim
         self.mlp = MLP(mlp_input_dim, mlp_output_dim, hidden_dims, activation)
 
@@ -150,14 +152,10 @@ class TSModel(nn.Module):
         if self.distribution is not None:
             self.distribution.init_mlp_weights(self.mlp)
 
-        # Student MLP — fresh init, trained from scratch by distillation in phase 2
-        self.student_mlp = MLP(mlp_input_dim, mlp_output_dim, hidden_dims, activation)
-
         print(f"PrivilegedEncoder: {self.privileged_encoder}")
         if self.proprioceptive_encoder is not None:
             print(f"ProprioceptiveEncoder: {self.proprioceptive_encoder}")
-        print(f"Teacher MLP: {self.mlp}")
-        print(f"Student MLP: {self.student_mlp}")
+        print(f"Shared Policy MLP: {self.mlp}")
 
     # ------------------------------------------------------------------ #
     # MLPModel-compatible interface                                         #
@@ -171,7 +169,7 @@ class TSModel(nn.Module):
         stochastic_output: bool = False,
     ) -> torch.Tensor:
         latent = self.get_latent(obs, masks, hidden_state)
-        mlp_output = self.student_mlp(latent) if self._student_mode else self.mlp(latent)
+        mlp_output = self.mlp(latent)  # shared policy network for both teacher and student
         if self.distribution is not None:
             if stochastic_output:
                 self.distribution.update(mlp_output)
@@ -186,10 +184,9 @@ class TSModel(nn.Module):
         hidden_state: HiddenState = None,
     ) -> torch.Tensor:
         if self._student_mode and self.proprioceptive_encoder is not None:
-            encoder_latent = self.proprioceptive_encoder(obs[self.history_obs_key])
+            encoder_latent = self.proprio_encode(obs)
         else:
-            encoder_latent = self.privileged_encoder(obs[self.privileged_obs_key])
-        encoder_latent = encoder_latent.clamp(-50.0, 50.0)
+            encoder_latent = self.privileged_encode(obs)
         parts = [encoder_latent, obs[self.raw_obs_key]]
         if self.commands_key is not None:
             parts.append(obs[self.commands_key])
@@ -244,16 +241,16 @@ class TSModel(nn.Module):
         self._student_mode = False
 
     def proprio_encode(self, obs: TensorDict) -> torch.Tensor:
-        """Encode obs history with the proprioceptive encoder."""
+        """Encode obs history → L2-normalized latent on unit hypersphere (CTS paper)."""
         if self.proprioceptive_encoder is None:
             raise RuntimeError(
                 "No proprioceptive_encoder — this model was created with history_obs_key=None."
             )
-        return self.proprioceptive_encoder(obs[self.history_obs_key])
+        return F.normalize(self.proprioceptive_encoder(obs[self.history_obs_key]), p=2, dim=-1)
 
     def privileged_encode(self, obs: TensorDict) -> torch.Tensor:
-        """Encode privileged obs with the privileged encoder."""
-        return self.privileged_encoder(obs[self.privileged_obs_key])
+        """Encode privileged obs → L2-normalized latent on unit hypersphere (CTS paper)."""
+        return F.normalize(self.privileged_encoder(obs[self.privileged_obs_key]), p=2, dim=-1)
 
     def act_inference_student(self, obs: TensorDict) -> torch.Tensor:
         """Deterministic forward pass using the proprioceptive (student) encoder."""
@@ -295,7 +292,7 @@ class _TorchTSStudentModel(nn.Module):
         if model.proprioceptive_encoder is None:
             raise ValueError("Cannot export student model: history_obs_key was set to None.")
         self.proprio_encoder = copy.deepcopy(model.proprioceptive_encoder)
-        self.mlp = copy.deepcopy(model.student_mlp)
+        self.mlp = copy.deepcopy(model.mlp)  # shared policy network
         if model.distribution is not None:
             self.deterministic_output: nn.Module = model.distribution.as_deterministic_output_module()
         else:
@@ -307,7 +304,7 @@ class _TorchTSStudentModel(nn.Module):
         raw_obs: torch.Tensor,
         commands: torch.Tensor,
     ) -> torch.Tensor:
-        latent = self.proprio_encoder(obs_history)
+        latent = F.normalize(self.proprio_encoder(obs_history), p=2, dim=-1)
         x = torch.cat([latent, raw_obs, commands], dim=-1)
         out = self.mlp(x)
         return self.deterministic_output(out)
@@ -328,7 +325,7 @@ class _OnnxTSStudentModel(nn.Module):
             raise ValueError("Cannot export student model: history_obs_key was set to None.")
         self.verbose = verbose
         self.proprio_encoder = copy.deepcopy(model.proprioceptive_encoder)
-        self.mlp = copy.deepcopy(model.student_mlp)
+        self.mlp = copy.deepcopy(model.mlp)  # shared policy network
         if model.distribution is not None:
             self.deterministic_output: nn.Module = model.distribution.as_deterministic_output_module()
         else:
@@ -343,7 +340,7 @@ class _OnnxTSStudentModel(nn.Module):
         raw_obs: torch.Tensor,
         commands: torch.Tensor,
     ) -> torch.Tensor:
-        latent = self.proprio_encoder(obs_history)
+        latent = F.normalize(self.proprio_encoder(obs_history), p=2, dim=-1)
         x = torch.cat([latent, raw_obs, commands], dim=-1)
         out = self.mlp(x)
         return self.deterministic_output(out)

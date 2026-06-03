@@ -31,16 +31,12 @@ class RslRlTSActorCfg(RslRlModelCfg):
 
 @dataclass
 class RslRlTSPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
-    """PPO algorithm config extended with teacher-student training options."""
+    """PPO algorithm config for CTS (Concurrent Teacher-Student) training."""
 
     class_name: str = "rsl_rl.algorithms:PPO"
     """Qualified class name so resolve_callable works with the local namespace package."""
-    student_reinforcing: bool = False
-    """If True, train with the proprioceptive encoder in the main loop (no privileged
-    encoder gradient). Used after an initial teacher-supervised phase."""
-    num_proprio_encoder_substeps: int = 1
-    """Extra gradient steps per update to distill the privileged latent into the
-    proprioceptive encoder via MSE loss."""
+    teacher_ratio: float = 0.75
+    """Fraction of envs acting as teacher group (privileged encoder). Rest is student group."""
     grad_penalty_coef_schedule: Optional[List[float]] = field(
         default_factory=lambda: [0.002, 0.002, 0, 1]
     )
@@ -48,8 +44,6 @@ class RslRlTSPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     Set to None to disable the penalty."""
     clip_reward: Optional[float] = 100.0
     """Clip total reward per step to [-clip_reward, clip_reward]. Matches isaacgym clip_reward."""
-    teacher_phase_iters: int = 3000
-    """Train teacher (privileged encoder + MLP) for this many iters, then freeze and train student."""
 
 
 def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
@@ -89,8 +83,8 @@ def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
             lam=0.95,
             desired_kl=0.01,
             max_grad_norm=1.0,
-            num_proprio_encoder_substeps=1,
+            teacher_ratio=0.75,
             grad_penalty_coef_schedule=[0.002, 0.002, 0, 1],
-            teacher_phase_iters=12010,
+            clip_reward=100.0,
         ),
     )
