@@ -77,17 +77,24 @@ def feet_distance(
     foot_pos_w = asset.data.body_link_pos_w[:, env._wheels_link_ids, :2]
     dist = torch.norm(foot_pos_w[:, 0, :] - foot_pos_w[:, 1, :], dim=-1)
     raw = torch.clamp(min_dist - dist, 0.0, 1.0) + torch.clamp(dist - max_dist, 0.0, 1.0)
-    return raw.clamp(0.0, 0.05)  # weight=-100 → max weighted=-5
+    # isaacgym clip_single_reward=5 applies to the dt-scaled reward (func*weight*dt),
+    # so the raw-func cap is 5/(|weight|*step_dt). weight=-100.
+    return raw.clamp(0.0, 5.0 / (100.0 * env.step_dt))
 
 
 def base_height_penalty(
         env: ManagerBasedRlEnv,
         target: float = 0.7664,
+        sensor_name: str = "terrain_scan",
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Penalize deviation of base height from target (isaacgym style)."""
+    """Penalize deviation from target height above terrain (matches isaacgym measured_heights)."""
     asset: Entity = env.scene[asset_cfg.name]
-    return torch.abs(asset.data.root_link_pos_w[:, 2] - target).clamp(0.0, 0.25)  # weight=-20 → max weighted=-5
+    robot_z = asset.data.root_link_pos_w[:, 2]
+    # mean(robot_z - terrain_z) across all raycast scan points — same as isaacgym
+    sensor = env.scene[sensor_name]
+    base_height = (robot_z.unsqueeze(1) - sensor.data.hit_pos_w[..., 2]).mean(dim=1)
+    return torch.abs(base_height - target).clamp(0.0, 5.0 / (20.0 * env.step_dt))  # weight=-20
 
 
 # ── Velocity tracking ─────────────────────────────────────────────────────────
@@ -124,7 +131,8 @@ def tracking_lin_vel_pb(env: ManagerBasedRlEnv) -> torch.Tensor:
     just_reset = env.episode_length_buf <= 1
     delta = torch.where(just_reset, torch.zeros_like(current), current - env._prev_tracking_lin_vel)  # type: ignore
     env._prev_tracking_lin_vel = current.clone()  # type: ignore
-    return (delta / env.step_dt).clamp(-5.0, 5.0)
+    # value = (delta/dt)*weight*dt = delta*weight; clip_single_reward=5 → cap delta/dt at 5/(|weight|*dt). weight=1.0
+    return (delta / env.step_dt).clamp(-5.0 / (1.0 * env.step_dt), 5.0 / (1.0 * env.step_dt))
 
 
 def tracking_ang_vel_pb(env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -135,7 +143,8 @@ def tracking_ang_vel_pb(env: ManagerBasedRlEnv) -> torch.Tensor:
     just_reset = env.episode_length_buf <= 1
     delta = torch.where(just_reset, torch.zeros_like(current), current - env._prev_tracking_ang_vel)  # type: ignore
     env._prev_tracking_ang_vel = current.clone()  # type: ignore
-    return (delta / env.step_dt).clamp(-25.0, 25.0)
+    # cap delta/dt at 5/(|weight|*dt). weight=0.2
+    return (delta / env.step_dt).clamp(-5.0 / (0.2 * env.step_dt), 5.0 / (0.2 * env.step_dt))
 
 
 # ── Penalties ─────────────────────────────────────────────────────────────────
@@ -145,7 +154,7 @@ def lin_vel_z(
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     asset: Entity = env.scene[asset_cfg.name]
-    return torch.square(asset.data.root_link_lin_vel_b[:, 2]).clamp(0.0, 5.0 / 0.3)
+    return torch.square(asset.data.root_link_lin_vel_b[:, 2]).clamp(0.0, 5.0 / (0.3 * env.step_dt))
 
 
 def ang_vel_xy(
@@ -153,7 +162,7 @@ def ang_vel_xy(
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     asset: Entity = env.scene[asset_cfg.name]
-    return torch.sum(torch.square(asset.data.root_link_ang_vel_b[:, :2]), dim=1).clamp(0.0, 5.0 / 0.3)
+    return torch.sum(torch.square(asset.data.root_link_ang_vel_b[:, :2]), dim=1).clamp(0.0, 5.0 / (0.3 * env.step_dt))
 
 
 def orientation_penalty(
@@ -161,7 +170,7 @@ def orientation_penalty(
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     asset: Entity = env.scene[asset_cfg.name]
-    return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1).clamp(0.0, 5.0 / 12.0)
+    return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1).clamp(0.0, 5.0 / (12.0 * env.step_dt))
 
 
 def dof_acc(
@@ -179,7 +188,7 @@ def same_foot_x_position(
     """Penalize feet having different x positions in base frame."""
     asset: Entity = env.scene[asset_cfg.name]
     foot_pos_b = _get_foot_positions_b(env, asset)
-    return torch.abs(foot_pos_b[:, 0, 0] - foot_pos_b[:, 1, 0]).clamp(0.0, 0.1)  # weight=-50 → max weighted=-5
+    return torch.abs(foot_pos_b[:, 0, 0] - foot_pos_b[:, 1, 0]).clamp(0.0, 5.0 / (50.0 * env.step_dt))  # weight=-50
 
 
 def same_foot_z_position(
@@ -189,24 +198,22 @@ def same_foot_z_position(
     """Penalize feet being at different heights in base frame."""
     asset: Entity = env.scene[asset_cfg.name]
     foot_pos_b = _get_foot_positions_b(env, asset)
-    return ((foot_pos_b[:, 0, 2] - foot_pos_b[:, 1, 2]) ** 2).clamp(0.0, 0.05)  # weight=-100 → max weighted=-5
+    return ((foot_pos_b[:, 0, 2] - foot_pos_b[:, 1, 2]) ** 2).clamp(0.0, 5.0 / (100.0 * env.step_dt))  # weight=-100
 
 
 def collision_penalty(
         env: ManagerBasedRlEnv,
-        threshold: float = 0.05,
-        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+        sensor_name: str = "collision_contact",
+        force_threshold: float = 1.0,
 ) -> torch.Tensor:
-    """Penalize knee/hip links being close to ground (contact proxy)."""
-    asset: Entity = env.scene[asset_cfg.name]
-    if not hasattr(env, "_penalized_body_ids"):
-        knee_ids, _ = asset.find_bodies("knee_[RL]_Link")
-        hip_ids, _ = asset.find_bodies("hip_[RL]_Link")
-        env._penalized_body_ids = knee_ids + hip_ids  # type: ignore
-    body_z = asset.data.body_link_pos_w[:, env._penalized_body_ids, 2]
-    wheel_z = asset.data.body_link_pos_w[:, env._wheels_link_ids, 2].mean(dim=1, keepdim=True)
-    contacts = (body_z < wheel_z + threshold).float()
-    return contacts.sum(dim=1).clamp(0.0, 0.1)  # weight=-50 → max weighted=-5
+    """Penalize contact force > threshold on knee/hip links (matches isaacgym penalised_contact_indices)."""
+    sensor = env.scene[sensor_name]
+    # force: [B, N, 3], N = num knee/hip bodies (4)
+    force_norms = torch.norm(sensor.data.force, dim=-1)  # [B, N]
+    contacts = (force_norms > force_threshold).float()
+    # isaacgym: torch.sum(norm > 1.0) → count of bodies in contact (0-4).
+    # value = count*weight*dt = count*(-50)*0.02 = -1.0/body; max -4.0 < clip_single_reward=5, never clipped.
+    return contacts.sum(dim=1)
 
 
 def joint_vel_l2(
@@ -247,17 +254,17 @@ def action_smoothness_penalty(env: ManagerBasedRlEnv) -> torch.Tensor:
     env._smooth_prev_prev = env._smooth_prev  # type: ignore
     env._smooth_prev = current  # type: ignore
     penalty[env.episode_length_buf < 3] = 0
-    return penalty.clamp(0.0, 5.0 / 0.03)
+    return penalty.clamp(0.0, 5.0 / (0.03 * env.step_dt))
 
 
 def action_rate(env: ManagerBasedRlEnv) -> torch.Tensor:
-    """Clipped wrapper around mjlab action_rate_l2 (weight=-0.03 → max=166.67)."""
-    return _action_rate_l2(env).clamp(0.0, 5.0 / 0.03)
+    """Clipped wrapper around mjlab action_rate_l2 (weight=-0.03)."""
+    return _action_rate_l2(env).clamp(0.0, 5.0 / (0.03 * env.step_dt))
 
 
 def dof_pos_limits(
         env: ManagerBasedRlEnv,
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Clipped wrapper around mjlab joint_pos_limits (weight=-2.0 → max=2.5)."""
-    return _joint_pos_limits(env, asset_cfg=asset_cfg).clamp(0.0, 5.0 / 2.0)
+    """Clipped wrapper around mjlab joint_pos_limits (weight=-2.0)."""
+    return _joint_pos_limits(env, asset_cfg=asset_cfg).clamp(0.0, 5.0 / (2.0 * env.step_dt))

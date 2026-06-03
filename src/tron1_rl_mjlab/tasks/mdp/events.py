@@ -51,10 +51,14 @@ def prepare_quantities(
 
     assert (nominal_foot_position_b != 0.0).any(), "Failed to compute nominal foot positions"
 
+    # isaacgym: terminate_after_contacts_on = ["abad", "base"]
+    terminate_idx, _ = asset.find_bodies("(abad_[LR]_Link|base_Link)")
+
     env._nominal_foot_position_b = nominal_foot_position_b  # type: ignore
     env._wheels_link_ids = wheel_link_idx  # type: ignore
     env._wheels_joint_ids = wheel_joint_ids  # type: ignore
     env._foot_radius = 0.127  # type: ignore
+    env._terminate_link_ids = terminate_idx  # type: ignore
 
 
 def randomize_default_joint_pos(

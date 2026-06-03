@@ -11,13 +11,13 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.scene import SceneCfg
-from mjlab.sensor import GridPatternCfg, ObjRef, RayCastSensorCfg
+from mjlab.sensor import ContactMatch, ContactSensorCfg, GridPatternCfg, ObjRef, RayCastSensorCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.utils.noise import GaussianNoiseCfg
 from mjlab.viewer import ViewerConfig
 
 from ...assets.wf_tron.wf_tron import WF_TRON_ROBOT_CFG
-from .terrain_cfg import TERRAINS_ENTITY_CFG, PLANE_ENTITY_CFG
+from .terrain_cfg import ROUGH_TERRAINS_ENTITY_CFG, PLANE_ENTITY_CFG, TERRAINS_ENTITY_CFG
 from .. import mdp
 
 # 13×9 = 117 rays — matches isaacgym num_height_samples=117
@@ -30,12 +30,28 @@ TERRAIN_SCAN_CFG = RayCastSensorCfg(
     exclude_parent_body=True,
 )
 
+# Contact force on knee/hip — isaacgym penalised_contact_indices
+COLLISION_CONTACT_CFG = ContactSensorCfg(
+    name="collision_contact",
+    primary=ContactMatch(mode="body", pattern="(knee|hip)_[RL]_Link", entity="robot"),
+    fields=("force",),
+    reduce="netforce",  # net force in global frame per body
+)
+
+# Contact force on abad/base — isaacgym terminate_after_contacts_on
+TERMINATION_CONTACT_CFG = ContactSensorCfg(
+    name="termination_contact",
+    primary=ContactMatch(mode="body", pattern="(abad_[LR]_Link|base_Link)", entity="robot"),
+    fields=("force",),
+    reduce="netforce",
+)
+
 SCENE_CFG = SceneCfg(
     num_envs=4096,
     extent=1.0,
-    terrain=TERRAINS_ENTITY_CFG,
+    terrain=ROUGH_TERRAINS_ENTITY_CFG,
     entities={"robot": WF_TRON_ROBOT_CFG},
-    sensors=(TERRAIN_SCAN_CFG,),
+    sensors=(TERRAIN_SCAN_CFG, COLLISION_CONTACT_CFG, TERMINATION_CONTACT_CFG),
 )
 
 VIEWER_CONFIG = ViewerConfig(
@@ -140,9 +156,9 @@ def make_observations() -> dict[str, ObservationGroupCfg]:
         ),
         "height_scan": ObservationTermCfg(
             func=mdp.height_scan,
-            params={"sensor_name": "terrain_scan", "offset": 0.5},
-            clip=(-1.0, 1.0),     # matches isaacgym clip before *5.0
-            scale=5.0,            # matches isaacgym obs_scales.height_measurements=5.0
+            params={"sensor_name": "terrain_scan"},
+            clip=(-1.0, 1.0),
+            scale=5.0,
         ),
     }
 
@@ -175,74 +191,6 @@ def make_events() -> dict[str, EventTermCfg]:
             mode="startup",
             params={"asset_cfg": SceneEntityCfg("robot")},
         ),
-        "add_base_mass": EventTermCfg(
-            func=mdp.dr.body_mass,
-            mode="startup",
-            params={
-                "ranges": (-0.5, 2.0),
-                "operation": "add",
-                "distribution": "uniform",
-                "asset_cfg": SceneEntityCfg("robot", body_names="base_Link"),
-            },
-        ),
-        "add_link_mass": EventTermCfg(
-            func=mdp.dr.body_mass,
-            mode="startup",
-            params={
-                "ranges": (0.8, 1.2),
-                "operation": "scale",
-                "distribution": "uniform",
-                "asset_cfg": SceneEntityCfg("robot", body_names=".*_[LR]_Link"),
-            },
-        ),
-        "robot_physics_material": EventTermCfg(
-            func=mdp.dr.geom_friction,
-            mode="startup",
-            params={
-                "ranges": {
-                    0: (0.2, 1.6),
-                    1: (0.2, 0.9),
-                    2: (0.0, 1.0),
-                },
-                "operation": "abs",
-                "distribution": "uniform",
-                "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            },
-        ),
-        "robot_center_of_mass": EventTermCfg(
-            func=mdp.dr.body_com_offset,
-            mode="startup",
-            params={
-                "ranges": {
-                    0: (-0.03, 0.03),
-                    1: (-0.02, 0.02),
-                    2: (-0.03, 0.03),
-                },
-                "operation": "add",
-                "distribution": "uniform",
-                "asset_cfg": SceneEntityCfg("robot"),
-            },
-        ),
-        "randomize_joint_stiffness": EventTermCfg(
-            func=mdp.dr.joint_stiffness,
-            mode="startup",
-            params={
-                "ranges": (0.8, 1.2),
-                "operation": "scale",
-                "distribution": "log_uniform",
-                "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
-            },
-        ),
-        "randomize_joint_damping": EventTermCfg(
-            func=mdp.dr.joint_damping,
-            mode="startup",
-            params={
-                "ranges": (0.8, 1.2),
-                "operation": "scale",
-                "distribution": "log_uniform",
-                "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
-            },
-        ),
         # Reset
         "reset_robot_base": EventTermCfg(
             func=mdp.reset_root_state_uniform,
@@ -266,22 +214,6 @@ def make_events() -> dict[str, EventTermCfg]:
                 "position_range": (-0.2, 0.2),
                 "velocity_range": (-0.5, 0.5),
             },
-        ),
-        # isaacgym: randomize_default_dof_pos ±0.05
-        "randomize_default_joint_pos": EventTermCfg(
-            func=mdp.randomize_default_joint_pos,
-            mode="startup",
-            params={
-                "offset_range": (-0.05, 0.05),
-                "asset_cfg": SceneEntityCfg("robot"),
-            },
-        ),
-        # Interval
-        "push_robot": EventTermCfg(
-            func=mdp.push_by_setting_velocity,
-            mode="interval",
-            interval_range_s=(7.0, 10.0),
-            params={"velocity_range": {"x": (-1.5, 1.5), "y": (-1.5, 1.5)}},
         ),
     }
 
@@ -374,12 +306,11 @@ def make_rewards() -> dict[str, RewardTermCfg]:
         "dof_pos_limits": RewardTermCfg(
             func=mdp.dof_pos_limits,
             weight=-2.0,
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names="(?!wheel_).*")},
         ),
         "collision": RewardTermCfg(
             func=mdp.collision_penalty,
             weight=-50.0,
-            params={"threshold": 0.05},
+            params={"sensor_name": "collision_contact", "force_threshold": 1.0},
         ),
         "feet_distance": RewardTermCfg(
             func=mdp.feet_distance,
@@ -389,7 +320,7 @@ def make_rewards() -> dict[str, RewardTermCfg]:
         "base_height": RewardTermCfg(
             func=mdp.base_height_penalty,
             weight=-20.0,
-            params={"target": 0.7664},
+            params={"target": 0.7664, "sensor_name": "terrain_scan"},
         ),
     }
 
@@ -397,13 +328,9 @@ def make_rewards() -> dict[str, RewardTermCfg]:
 def make_terminations() -> dict[str, TerminationTermCfg]:
     return {
         "time_out": TerminationTermCfg(func=mdp.time_out, time_out=True),
-        "bad_orientation": TerminationTermCfg(
-            func=mdp.bad_orientation_timer,
-            params={"limit_angle": math.pi * 0.4, "fail_time": 0.5},
-        ),
-        "bad_height": TerminationTermCfg(
-            func=mdp.bad_height_timer,
-            params={"limit_height": 0.5, "fail_time": 0.5},
+        "failing": TerminationTermCfg(
+            func=mdp.failing_timer,
+            params={"fail_time": 0.5, "contact_force_threshold": 10.0, "sensor_name": "termination_contact"},
         ),
     }
 
@@ -413,6 +340,26 @@ def make_curriculum() -> dict[str, CurriculumTermCfg]:
         "terrain_levels": CurriculumTermCfg(
             func=mdp.terrain_levels_vel,
             params={"command_name": "base_velocity"},
+        ),
+        "ep_len_flat": CurriculumTermCfg(
+            func=mdp.episode_length_by_terrain,
+            params={"terrain_type": "flat"},
+        ),
+        "ep_len_slope": CurriculumTermCfg(
+            func=mdp.episode_length_by_terrain,
+            params={"terrain_type": "pyramid_slope"},
+        ),
+        "ep_len_stairs_down": CurriculumTermCfg(
+            func=mdp.episode_length_by_terrain,
+            params={"terrain_type": "pyramid_stairs_down"},
+        ),
+        "ep_len_slope_inv": CurriculumTermCfg(
+            func=mdp.episode_length_by_terrain,
+            params={"terrain_type": "pyramid_slope_inv"},
+        ),
+        "ep_len_wave": CurriculumTermCfg(
+            func=mdp.episode_length_by_terrain,
+            params={"terrain_type": "wave"},
         ),
     }
 
@@ -444,6 +391,13 @@ def make_wf_tron_env_cfg() -> ManagerBasedRlEnvCfg:
         episode_length_s=20.0,
         seed=0,
     )
+
+
+def make_wf_tron_flat_env_cfg() -> ManagerBasedRlEnvCfg:
+    """Phase-1a env: flat terrain only (100%), same grid structure as rough terrain."""
+    env_cfg = deepcopy(make_wf_tron_env_cfg())
+    env_cfg.scene.terrain = TERRAINS_ENTITY_CFG
+    return env_cfg
 
 
 def make_wf_tron_play_env_cfg() -> ManagerBasedRlEnvCfg:

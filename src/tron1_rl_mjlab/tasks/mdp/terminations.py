@@ -34,6 +34,46 @@ def bad_orientation_timer(
     return timer >= fail_time
 
 
+def failing_timer(
+        env: ManagerBasedRlEnv,
+        fail_time: float = 0.5,
+        contact_force_threshold: float = 10.0,
+        sensor_name: str = "termination_contact",
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Terminate after accumulating fail_time seconds of failure — matches isaacgym check_termination:
+      - contact force > threshold on abad/base bodies
+      - OR projected_gravity_b[:, 2] > -0.1 (robot severely tilted)
+
+    isaacgym accumulates a CUMULATIVE bad-step counter (``fail_buf += bad``) that only
+    resets at episode reset — NOT a consecutive timer. A robot that briefly recovers
+    still keeps its accumulated failure count, so intermittent failures add up.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+
+    # Condition 1: contact force on abad/base bodies via ContactSensor
+    sensor = env.scene[sensor_name]
+    force_norms = torch.norm(sensor.data.force, dim=-1)  # [B, N]
+    bad_contact = torch.any(force_norms > contact_force_threshold, dim=1)
+
+    # Condition 2: projected gravity (isaacgym: projected_gravity[:, 2] > -0.1)
+    bad_orient = asset.data.projected_gravity_b[:, 2] > -0.1
+
+    bad = bad_contact | bad_orient
+
+    if not hasattr(env, "_fail_buf"):
+        env._fail_buf = torch.zeros(env.num_envs, device=env.device)
+
+    just_reset = env.episode_length_buf <= 1
+    fail_buf = env._fail_buf
+    fail_buf = torch.where(just_reset, torch.zeros_like(fail_buf), fail_buf)
+    fail_buf = fail_buf + bad.float()  # cumulative count of bad steps (isaacgym fail_buf += bad)
+    env._fail_buf = fail_buf
+
+    # isaacgym: reset when fail_buf > fail_to_terminal_time_s / dt
+    return fail_buf > fail_time / env.step_dt
+
+
 def bad_height_timer(
         env: ManagerBasedRlEnv,
         limit_height: float,

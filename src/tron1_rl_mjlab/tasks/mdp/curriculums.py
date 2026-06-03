@@ -14,6 +14,42 @@ from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
 
+def _terrain_type_col_ranges(env: ManagerBasedRlEnv) -> dict[str, tuple[int, int]]:
+    """Map sub_terrain name → (col_start, col_end) based on proportions."""
+    terrain = env.scene.terrain
+    if terrain is None or terrain.cfg.terrain_generator is None:
+        return {}
+    cfg = terrain.cfg.terrain_generator
+    num_cols = cfg.num_cols
+    cumulative = 0.0
+    ranges: dict[str, tuple[int, int]] = {}
+    for name, sub_cfg in cfg.sub_terrains.items():
+        start = round(cumulative * num_cols)
+        end = round((cumulative + sub_cfg.proportion) * num_cols)
+        ranges[name] = (start, end)
+        cumulative += sub_cfg.proportion
+    return ranges
+
+
+def episode_length_by_terrain(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    terrain_type: str,
+) -> torch.Tensor:
+    """Return mean episode length for envs on a specific terrain type (for wandb logging)."""
+    terrain = env.scene.terrain
+    if terrain is None or terrain.cfg.terrain_generator is None:
+        return torch.zeros(1)
+    ranges = _terrain_type_col_ranges(env)
+    if terrain_type not in ranges:
+        return torch.zeros(1)
+    start, end = ranges[terrain_type]
+    mask = (terrain.terrain_types >= start) & (terrain.terrain_types < end)
+    if mask.sum() == 0:
+        return torch.zeros(1)
+    return env.episode_length_buf[mask].float().mean().unsqueeze(0)
+
+
 def terrain_levels_vel(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
@@ -35,7 +71,7 @@ def terrain_levels_vel(
         asset.data.root_link_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1
     )
     terrain_size = terrain.cfg.terrain_generator.size
-    move_up = distance > terrain_size[0] / 2
+    move_up = distance > 2.0
     move_down = distance < torch.norm(command[env_ids, :2], dim=1) * env.max_episode_length_s * 0.5
     move_down *= ~move_up
 

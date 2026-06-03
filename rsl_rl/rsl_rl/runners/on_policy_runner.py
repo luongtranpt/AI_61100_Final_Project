@@ -81,6 +81,7 @@ class OnPolicyRunner:
         total_it = start_it + num_learning_iterations
         for it in range(start_it, total_it):
             start = time.time()
+            obs = self._on_iteration_start(it, obs)
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.cfg["num_steps_per_env"]):
@@ -141,6 +142,10 @@ class OnPolicyRunner:
         if self.logger.writer is not None:
             self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore
             self.logger.stop_logging_writer()
+
+    def _on_iteration_start(self, it: int, obs):
+        """Hook called at the start of each iteration. Subclasses can override to swap env etc."""
+        return obs
 
     def save(self, path: str, infos: dict | None = None) -> None:
         """Save the models and training state to a given path and upload them if external logging is used."""

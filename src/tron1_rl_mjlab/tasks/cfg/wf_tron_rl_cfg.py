@@ -57,7 +57,7 @@ def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
     return RslRlOnPolicyRunnerCfg(
         num_steps_per_env=24,
         max_iterations=1500000,
-        save_interval=200,
+        save_interval=2000,
         wandb_project="mjlab_wf_tron",
         experiment_name="wf_tron",
         obs_groups={"actor": ("actor", "history", "critic"), "critic": ("critic",)},
@@ -91,6 +91,6 @@ def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
             max_grad_norm=1.0,
             num_proprio_encoder_substeps=1,
             grad_penalty_coef_schedule=[0.002, 0.002, 0, 1],
-            teacher_phase_iters=8000,
+            teacher_phase_iters=12010,
         ),
     )
