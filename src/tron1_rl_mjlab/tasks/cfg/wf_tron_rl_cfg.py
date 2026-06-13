@@ -26,6 +26,8 @@ class RslRlTSActorCfg(RslRlModelCfg):
     """TensorDict key for the privileged observations (privileged encoder input)."""
     commands_key: Optional[str] = None
     """TensorDict key for the command/goal vector. None if commands are already in raw_obs_key."""
+    base_lin_vel_key: Optional[str] = "base_vel"
+    """TensorDict key for ground-truth base linear velocity (teacher input + student supervision)."""
 
 
 
@@ -54,13 +56,12 @@ def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
         save_interval=2000,
         wandb_project="mjlab_wf_tron",
         experiment_name="wf_tron",
-        obs_groups={"actor": ("actor", "history", "critic", "critic_no_vel"), "critic": ("critic",)},
+        obs_groups={"actor": ("actor", "history", "critic", "base_vel"), "critic": ("critic",)},
         actor=RslRlTSActorCfg(
             hidden_dims=(512, 256, 128),
             activation="elu",
             encoder_hidden_dims=(256, 128),
             encoder_latent_dim=16,
-            privileged_obs_key="critic_no_vel",
             distribution_cfg={
                 "class_name": "rsl_rl.modules:GaussianDistribution",
                 "init_std": 1.0,
