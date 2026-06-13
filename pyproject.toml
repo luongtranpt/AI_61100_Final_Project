@@ -21,5 +21,11 @@ members = [
 [tool.uv.sources]
 rsl-rl-lib = { workspace = true }
 
+[dependency-groups]
+dev = [
+    "jupyterlab>=4.5.8",
+    "pandas>=3.0.3",
+]
+
 [project.entry-points."mjlab.tasks"]
 tron1_rl_mjlab = "tron1_rl_mjlab"

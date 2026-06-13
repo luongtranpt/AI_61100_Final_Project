@@ -17,7 +17,7 @@ from mjlab.utils.noise import GaussianNoiseCfg
 from mjlab.viewer import ViewerConfig
 
 from ...assets.wf_tron.wf_tron import WF_TRON_ROBOT_CFG
-from .terrain_cfg import ROUGH_TERRAINS_ENTITY_CFG, PLANE_ENTITY_CFG, TERRAINS_ENTITY_CFG
+from .terrain_cfg import ROUGH_TERRAINS_ENTITY_CFG, PLANE_ENTITY_CFG
 from .. import mdp
 
 # 13×9 = 117 rays — matches isaacgym num_height_samples=117
@@ -180,12 +180,8 @@ def make_observations() -> dict[str, ObservationGroupCfg]:
             enable_corruption=False,
             concatenate_terms=True,
         ),
-        "base_vel": ObservationGroupCfg(
-            terms={"base_lin_vel": ObservationTermCfg(
-                func=mdp.base_lin_vel,
-                clip=(-5.0, 5.0),
-                scale=2.0,
-            )},
+        "critic_no_vel": ObservationGroupCfg(
+            terms=commands_terms | {"height_scan": critic_extra["height_scan"]} | policy_terms,
             enable_corruption=False,
             concatenate_terms=True,
         ),
@@ -237,7 +233,7 @@ def make_rewards() -> dict[str, RewardTermCfg]:
         # Tracking
         "tracking_lin_vel": RewardTermCfg(
             func=mdp.tracking_lin_vel,
-            weight=4.0,
+            weight=6.0,
             params={"std": 0.2, "command_name": "base_velocity"},
         ),
         "tracking_ang_vel": RewardTermCfg(
@@ -247,7 +243,7 @@ def make_rewards() -> dict[str, RewardTermCfg]:
         ),
         "tracking_lin_vel_pb": RewardTermCfg(
             func=mdp.tracking_lin_vel_pb,
-            weight=1.0,
+            weight=1.5,
         ),
         "tracking_ang_vel_pb": RewardTermCfg(
             func=mdp.tracking_ang_vel_pb,
@@ -402,15 +398,8 @@ def make_wf_tron_env_cfg() -> ManagerBasedRlEnvCfg:
     )
 
 
-def make_wf_tron_flat_env_cfg() -> ManagerBasedRlEnvCfg:
-    """Phase-1a env: flat terrain only (100%), same grid structure as rough terrain."""
-    env_cfg = deepcopy(make_wf_tron_env_cfg())
-    env_cfg.scene.terrain = TERRAINS_ENTITY_CFG
-    return env_cfg
-
-
 def make_wf_tron_play_env_cfg() -> ManagerBasedRlEnvCfg:
     env_cfg = deepcopy(make_wf_tron_env_cfg())
     env_cfg.scene.num_envs = 4
-    env_cfg.scene.terrain = PLANE_ENTITY_CFG
+    env_cfg.scene.terrain = ROUGH_TERRAINS_ENTITY_CFG
     return env_cfg
