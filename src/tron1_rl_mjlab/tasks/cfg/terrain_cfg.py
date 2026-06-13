@@ -6,16 +6,6 @@ from mjlab.terrains import (
     HfWaveTerrainCfg,
 )
 
-TERRAINS_CFG = TerrainGeneratorCfg(
-    size=(8.0, 8.0),
-    border_width=20.0,
-    num_rows=10,
-    num_cols=20,
-    sub_terrains={
-        "flat": BoxFlatTerrainCfg(proportion=1.0),
-    }
-)
-
 ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
     size=(8.0, 8.0),
     border_width=20.0,
@@ -55,13 +45,6 @@ ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
             vertical_scale=0.005,
         ),
     }
-)
-
-TERRAINS_ENTITY_CFG = TerrainEntityCfg(
-    terrain_type="generator",
-    terrain_generator=TERRAINS_CFG,
-    max_init_terrain_level=5,
-    env_spacing=2.5,
 )
 
 ROUGH_TERRAINS_ENTITY_CFG = TerrainEntityCfg(

@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "huggingface-hub>=1.19.0",
     "mjlab>=1.2.0",
     "rsl-rl-lib",
 ]
@@ -20,6 +21,12 @@ members = [
 
 [tool.uv.sources]
 rsl-rl-lib = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "jupyterlab>=4.5.8",
+    "pandas>=3.0.3",
+]
 
 [project.entry-points."mjlab.tasks"]
 tron1_rl_mjlab = "tron1_rl_mjlab"
