@@ -88,7 +88,6 @@ class TSModel(nn.Module):
         history_obs_key: str | None = "history",
         privileged_obs_key: str = "critic",
         commands_key: str | None = None,
-        base_lin_vel_key: str | None = "base_vel",
         hidden_dims: tuple[int, ...] | list[int] = (512, 256, 128),
         activation: str = "elu",
         distribution_cfg: dict | None = None,
@@ -100,20 +99,17 @@ class TSModel(nn.Module):
         self.history_obs_key = history_obs_key
         self.privileged_obs_key = privileged_obs_key
         self.commands_key = commands_key
-        self.base_lin_vel_key = base_lin_vel_key
         self._student_mode: bool = False
 
         # Compute input dimensions from the obs TensorDict
         raw_obs_dim: int = obs[raw_obs_key].shape[-1]
         privileged_obs_dim: int = obs[privileged_obs_key].shape[-1]
         commands_dim: int = obs[commands_key].shape[-1] if commands_key is not None else 0
-        vel_dim: int = obs[base_lin_vel_key].shape[-1] if base_lin_vel_key is not None else 0
 
         # Store for export helpers
         self._raw_obs_dim = raw_obs_dim
         self._commands_dim = commands_dim
         self._encoder_latent_dim = encoder_latent_dim
-        self._vel_dim = vel_dim
 
         # Privileged encoder (teacher) — always created
         self.privileged_encoder = Encoder(
@@ -147,21 +143,9 @@ class TSModel(nn.Module):
             self.distribution = None
             mlp_output_dim = output_dim
 
-        # Velocity predictor (student): obs_history → predicted_base_lin_vel
-        # Teacher uses ground-truth vel from obs[base_lin_vel_key]; student predicts it from history.
-        if base_lin_vel_key is not None and history_obs_key is not None:
-            activation_mod = resolve_nn_activation(activation)
-            self.vel_predictor: nn.Module | None = nn.Sequential(
-                nn.Linear(history_obs_dim, 128), activation_mod,
-                nn.Linear(128, 64), activation_mod,
-                nn.Linear(64, vel_dim),
-            )
-        else:
-            self.vel_predictor = None
-
-        # Shared policy MLP: input is (encoder_latent_dim + raw_obs_dim + vel_dim + commands_dim)
-        # Teacher feeds true vel; student feeds predicted vel — same MLP for both.
-        mlp_input_dim = encoder_latent_dim + raw_obs_dim + vel_dim + commands_dim
+        # Shared policy MLP: input is (encoder_latent_dim + raw_obs_dim + commands_dim)
+        # Used by BOTH teacher (privileged encoder) and student (proprio encoder) — CTS paper Fig.2
+        mlp_input_dim = encoder_latent_dim + raw_obs_dim + commands_dim
         self.mlp = MLP(mlp_input_dim, mlp_output_dim, hidden_dims, activation)
 
         # Distribution-specific MLP weight init
@@ -171,8 +155,6 @@ class TSModel(nn.Module):
         print(f"PrivilegedEncoder: {self.privileged_encoder}")
         if self.proprioceptive_encoder is not None:
             print(f"ProprioceptiveEncoder: {self.proprioceptive_encoder}")
-        if self.vel_predictor is not None:
-            print(f"VelPredictor: {self.vel_predictor}")
         print(f"Shared Policy MLP: {self.mlp}")
 
     # ------------------------------------------------------------------ #
@@ -205,14 +187,7 @@ class TSModel(nn.Module):
             encoder_latent = self.proprio_encode(obs)
         else:
             encoder_latent = self.privileged_encode(obs)
-        encoder_latent = encoder_latent.clamp(-50.0, 50.0)
         parts = [encoder_latent, obs[self.raw_obs_key]]
-        if self.base_lin_vel_key is not None:
-            if self._student_mode and self.vel_predictor is not None:
-                vel = self.vel_predictor(obs[self.history_obs_key])
-            else:
-                vel = obs[self.base_lin_vel_key]
-            parts.append(vel)
         if self.commands_key is not None:
             parts.append(obs[self.commands_key])
         return torch.cat(parts, dim=-1)
@@ -276,12 +251,6 @@ class TSModel(nn.Module):
     def privileged_encode(self, obs: TensorDict) -> torch.Tensor:
         """Encode privileged obs → L2-normalized latent on unit hypersphere (CTS paper)."""
         return F.normalize(self.privileged_encoder(obs[self.privileged_obs_key]), p=2, dim=-1)
-
-    def predict_vel(self, obs: TensorDict) -> torch.Tensor:
-        """Predict base_lin_vel from obs history (student velocity estimator)."""
-        if self.vel_predictor is None:
-            raise RuntimeError("vel_predictor not created (base_lin_vel_key=None).")
-        return self.vel_predictor(obs[self.history_obs_key])
 
     def act_inference_student(self, obs: TensorDict) -> torch.Tensor:
         """Deterministic forward pass using the proprioceptive (student) encoder."""

@@ -185,6 +185,20 @@ def launch_training(task_id: str, args: TrainConfig | None = None):
     log_root_path = Path("logs") / "rsl_rl" / args.agent.experiment_name
     log_root_path.resolve()
     log_dir_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    try:
+        import subprocess
+        branch = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        if branch and branch != "HEAD":
+            log_dir_name += f"_{branch}_{commit}"
+        elif commit:
+            log_dir_name += f"_{commit}"
+    except Exception:
+        pass
     if args.agent.run_name:
         log_dir_name += f"_{args.agent.run_name}"
     log_dir = log_root_path / log_dir_name

@@ -235,7 +235,7 @@ def run_play(task_id: str, cfg: PlayConfig):
             policy = PolicyRandom()
     else:
         runner_cls = load_runner_cls(task_id) or MjlabOnPolicyRunner
-        runner = runner_cls(env, asdict(agent_cfg), device=device)
+        runner = runner_cls(env, asdict(agent_cfg), log_dir=None, device=device)
         runner.load(
             str(resume_path), load_cfg={"actor": True}, strict=True, map_location=device
         )
