@@ -171,13 +171,13 @@ class OnPolicyRunner:
                 },
                 base + "_teacher.pt",
             )
-            # Student: proprioceptive_encoder + shared mlp (CTS: same policy network)
+            # Student: proprioceptive_encoder + student_mlp
             if actor.proprioceptive_encoder is not None:
                 torch.save(
                     {
                         "iter": self.current_learning_iteration,
                         "proprioceptive_encoder": actor.proprioceptive_encoder.state_dict(),
-                        "mlp": actor.mlp.state_dict(),
+                        "student_mlp": actor.student_mlp.state_dict(),
                     },
                     base + "_student.pt",
                 )

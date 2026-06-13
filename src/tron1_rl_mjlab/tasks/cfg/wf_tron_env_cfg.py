@@ -180,11 +180,6 @@ def make_observations() -> dict[str, ObservationGroupCfg]:
             enable_corruption=False,
             concatenate_terms=True,
         ),
-        "critic_no_vel": ObservationGroupCfg(
-            terms=commands_terms | {"height_scan": critic_extra["height_scan"]} | policy_terms,
-            enable_corruption=False,
-            concatenate_terms=True,
-        ),
     }
 
 

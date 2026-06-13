@@ -59,11 +59,14 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
-        # CTS parameters
-        teacher_ratio: float = 0.75,
+        # Teacher-student parameters
+        student_reinforcing: bool = False,
+        num_proprio_encoder_substeps: int = 1,
         grad_penalty_coef_schedule: list | None = None,
         # Reward clipping (matches isaacgym clip_reward)
         clip_reward: float | None = 100.0,
+        # 2-phase training: freeze teacher after this many iters, then train student
+        teacher_phase_iters: int = 0,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
@@ -114,41 +117,50 @@ class PPO:
         else:
             self.symmetry = None
 
-        # CTS parameters
+        # Teacher-student parameters
+        self.student_reinforcing = student_reinforcing
+        self.num_proprio_encoder_substeps = num_proprio_encoder_substeps
         self.grad_penalty_coef_schedule = grad_penalty_coef_schedule
         self.clip_reward = clip_reward
+        self.teacher_phase_iters = teacher_phase_iters
         self.counter = 0
 
         # PPO components
         self.actor = actor.to(self.device)
         self.critic = critic.to(self.device)
 
-        # Create the optimizer — overridden below for TSModel (CTS)
+        # Create the optimizer — overridden below for TSModel
         self.optimizer = resolve_optimizer(optimizer)(
             chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
         )  # type: ignore
         self.extra_optimizer: optim.Optimizer | None = None
 
-        # CTS: teacher/student concurrent training setup
+        # For TSModel: split optimizer to separate the proprioceptive encoder
         from rsl_rl.models.ts_model import TSModel
-        self.n_teacher = int(storage.num_envs * teacher_ratio)
-        self.teacher_mask = torch.zeros(storage.num_envs, dtype=torch.bool, device=device)
-        self.teacher_mask[:self.n_teacher] = True
-
         if isinstance(self.actor, TSModel):
-            # Main optimizer: privileged_encoder + shared mlp + critic
-            # (everything except proprioceptive_encoder — it's trained by supervised loss only)
-            actor_main_params = [
-                p for n, p in self.actor.named_parameters() if "proprioceptive_encoder" not in n
-            ]
-            self.optimizer = resolve_optimizer(optimizer)(
-                chain(actor_main_params, self.critic.parameters()), lr=learning_rate
-            )  # type: ignore
-            # Extra optimizer: proprioceptive encoder only (supervised reconstruction loss)
-            if self.actor.proprioceptive_encoder is not None:
-                self.extra_optimizer = optim.Adam(
-                    self.actor.proprioceptive_encoder.parameters(), lr=1e-3
-                )
+            if not student_reinforcing:
+                # Main optimizer: actor (excl. proprioceptive encoder) + critic
+                actor_main_params = [
+                    p for n, p in self.actor.named_parameters() if "proprioceptive_encoder" not in n
+                ]
+                self.optimizer = resolve_optimizer(optimizer)(
+                    chain(actor_main_params, self.critic.parameters()), lr=learning_rate
+                )  # type: ignore
+                # Extra optimizer: proprioceptive encoder + student MLP
+                if self.actor.proprioceptive_encoder is not None:
+                    student_params = chain(
+                        self.actor.proprioceptive_encoder.parameters(),
+                        self.actor.student_mlp.parameters(),
+                    )
+                    self.extra_optimizer = optim.Adam(student_params, lr=1e-3)
+            else:
+                # Student-reinforcing mode: exclude privileged encoder from main optimizer
+                actor_main_params = [
+                    p for n, p in self.actor.named_parameters() if "privileged_encoder" not in n
+                ]
+                self.optimizer = resolve_optimizer(optimizer)(
+                    chain(actor_main_params, self.critic.parameters()), lr=learning_rate
+                )  # type: ignore
 
         # Add storage
         self.storage = storage
@@ -170,40 +182,19 @@ class PPO:
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
     def act(self, obs: TensorDict) -> torch.Tensor:
-        """Sample actions for teacher and student groups concurrently (CTS)."""
-        self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
-
+        """Sample actions and store transition data."""
+        # Phase 2: student acts in env so rollout is on-policy for student (pointfoot style)
         from rsl_rl.models.ts_model import TSModel
-        if isinstance(self.actor, TSModel) and self.actor.proprioceptive_encoder is not None and self.n_teacher < obs.batch_size[0]:
-            # CTS concurrent rollout: teacher group uses privileged encoder, student uses proprio
-            n = self.n_teacher
-            obs_t = obs[:n]
-            obs_s = obs[n:]
-
-            self.actor.use_teacher_mode()
-            actions_t = self.actor(obs_t, stochastic_output=True).detach()
-            log_prob_t = self.actor.get_output_log_prob(actions_t).detach()
-            dist_params_t = tuple(p.detach() for p in self.actor.output_distribution_params)
-
+        if isinstance(self.actor, TSModel) and self.teacher_phase_iters > 0 and self.counter >= self.teacher_phase_iters:
             self.actor.use_student_mode()
-            actions_s = self.actor(obs_s, stochastic_output=True).detach()
-            log_prob_s = self.actor.get_output_log_prob(actions_s).detach()
-            dist_params_s = tuple(p.detach() for p in self.actor.output_distribution_params)
-
-            self.transition.actions = torch.cat([actions_t, actions_s], dim=0)
-            self.transition.actions_log_prob = torch.cat([log_prob_t, log_prob_s], dim=0)
-            self.transition.distribution_params = tuple(
-                torch.cat([pt, ps], dim=0) for pt, ps in zip(dist_params_t, dist_params_s)
-            )
-            self.transition.teacher_mask = self.teacher_mask
-        else:
-            if isinstance(self.actor, TSModel):
-                self.actor.use_teacher_mode()
-            self.transition.actions = self.actor(obs, stochastic_output=True).detach()
-            self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()
-            self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
-
+        # Record the hidden states for recurrent policies
+        self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
+        # Compute the actions and values
+        self.transition.actions = self.actor(obs, stochastic_output=True).detach()
         self.transition.values = self.critic(obs).detach()
+        self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()  # type: ignore
+        self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
+        # Record observations before env.step()
         self.transition.observations = obs
         return self.transition.actions  # type: ignore
 
@@ -269,107 +260,168 @@ class PPO:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
 
     def update(self) -> dict[str, float]:
-        """CTS: concurrent teacher-student PPO update."""
-        mean_value_loss = 0.0
-        mean_surrogate_loss = 0.0
-        mean_entropy = 0.0
+        """Run optimization epochs over stored batches and return mean losses."""
+        mean_value_loss = 0
+        mean_surrogate_loss = 0
+        mean_entropy = 0
         mean_gradient_penalty = 0.0
-        mean_rec_loss = 0.0
+        mean_proprio_extra_loss = 0.0
         mean_teacher_student_mse = 0.0
+        mean_encoder_distill_loss = 0.0
+        mean_action_distill_loss = 0.0
+        # RND loss
         mean_rnd_loss = 0 if self.rnd else None
+        # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
 
+        # Compute gradient penalty coefficient from schedule
         gradient_penalty_coef = 0.0
         if self.grad_penalty_coef_schedule is not None:
             s_start, s_end, s_begin_step, s_duration = self.grad_penalty_coef_schedule
             stage = min(max((self.counter - s_begin_step), 0) / max(s_duration, 1), 1.0)
             gradient_penalty_coef = stage * (s_end - s_start) + s_start
 
-        from rsl_rl.models.ts_model import TSModel
-        is_cts = (
-            isinstance(self.actor, TSModel)
-            and self.actor.proprioceptive_encoder is not None
-            and self.n_teacher < self.storage.num_envs
-        )
+        # 2-phase: phase 1 = RL teacher only, phase 2 = distillation student only
+        in_student_phase = self.teacher_phase_iters > 0 and self.counter >= self.teacher_phase_iters
 
+        # ── Phase 2: pointfoot-style distillation ─────────────────────────────────────
+        # Full buffer → 1 gradient step → L2 norm loss (no epochs/mini-batches)
+        if in_student_phase:
+            mean_encoder_distill_loss = 0.0
+            mean_action_distill_loss = 0.0
+            mean_teacher_student_mse = 0.0
+            if self.extra_optimizer is not None:
+                # All transitions in one batch (pointfoot: no mini-batch, no epoch loop)
+                batch = next(self.storage.mini_batch_generator(1, 1))
+
+                # Student forward WITH gradients
+                student_latent = self.actor.proprio_encode(batch.observations)  # type: ignore[attr-defined]
+                student_act = self.actor.act_inference_student(batch.observations)  # type: ignore[attr-defined]
+                # Teacher forward frozen
+                with torch.no_grad():
+                    teacher_latent = self.actor.privileged_encode(batch.observations)  # type: ignore[attr-defined]
+                    teacher_act = self.actor.act_inference_teacher(batch.observations)  # type: ignore[attr-defined]
+
+                # L2 norm per sample then mean (pointfoot style, not MSE)
+                encoder_loss = (teacher_latent.detach() - student_latent).norm(p=2, dim=1).mean()
+                actor_loss = (teacher_act.detach() - student_act).norm(p=2, dim=1).mean()
+                distill_loss = encoder_loss + actor_loss
+
+                self.extra_optimizer.zero_grad()
+                distill_loss.backward()
+                nn.utils.clip_grad_norm_(
+                    chain(
+                        self.actor.proprioceptive_encoder.parameters(),  # type: ignore[union-attr]
+                        self.actor.student_mlp.parameters(),  # type: ignore[attr-defined]
+                    ),
+                    self.max_grad_norm,
+                )
+                self.extra_optimizer.step()
+
+                mean_encoder_distill_loss = encoder_loss.item()
+                mean_action_distill_loss = actor_loss.item()
+                mean_teacher_student_mse = distill_loss.item()
+
+            self.storage.clear()
+            self.update_counter()
+            return {
+                "value": 0.0, "surrogate": 0.0, "entropy": 0.0,
+                "gradient_penalty": 0.0, "gradient_penalty_coef": 0.0,
+                "proprio_extra": 0.0, "teacher_student_mse": mean_teacher_student_mse,
+                "encoder_distill": mean_encoder_distill_loss,
+                "action_distill": mean_action_distill_loss,
+            }
+        # ──────────────────────────────────────────────────────────────────────────────
+
+        # Get mini batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
+        # Iterate over batches
         for batch in generator:
 
             original_batch_size = batch.observations.batch_size[0]
 
+            # Check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
                     batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)  # type: ignore
 
-            # ── Forward pass: teacher group + student group ───────────────────────────
-            if is_cts and batch.teacher_mask is not None:
-                t_idx = batch.teacher_mask.squeeze(-1)  # [B] bool
-                s_idx = ~t_idx
-                B = original_batch_size
+            # Perform symmetric augmentation
+            if self.symmetry and self.symmetry["use_data_augmentation"]:
+                # Augmentation using symmetry
+                data_augmentation_func = self.symmetry["data_augmentation_func"]
+                # Returned shape: [batch_size * num_aug, ...]
+                batch.observations, batch.actions = data_augmentation_func(
+                    env=self.symmetry["_env"],
+                    obs=batch.observations,
+                    actions=batch.actions,
+                )
+                # Compute number of augmentations per sample
+                num_aug = int(batch.observations.batch_size[0] / original_batch_size)
+                # Repeat the rest of the batch
+                batch.old_actions_log_prob = batch.old_actions_log_prob.repeat(num_aug, 1)
+                batch.values = batch.values.repeat(num_aug, 1)
+                batch.advantages = batch.advantages.repeat(num_aug, 1)
+                batch.returns = batch.returns.repeat(num_aug, 1)
 
-                # Teacher forward (privileged encoder → mlp)
-                self.actor.use_teacher_mode()
-                self.actor(batch.observations[t_idx], stochastic_output=True)
-                log_prob_t = self.actor.get_output_log_prob(batch.actions[t_idx])
-                dist_params_t = tuple(p.clone() for p in self.actor.output_distribution_params)
-                entropy_t = self.actor.output_entropy.clone()
-
-                # Student forward (proprio encoder → shared mlp)
-                self.actor.use_student_mode()
-                self.actor(batch.observations[s_idx], stochastic_output=True)
-                log_prob_s = self.actor.get_output_log_prob(batch.actions[s_idx])
-                dist_params_s = tuple(p.clone() for p in self.actor.output_distribution_params)
-                entropy_s = self.actor.output_entropy.clone()
-
-                # Reconstruct full-batch tensors in shuffled order
-                actions_log_prob = torch.empty(B, device=self.device)
-                actions_log_prob[t_idx] = log_prob_t
-                actions_log_prob[s_idx] = log_prob_s
-
-                entropy = torch.empty(B, device=self.device)
-                entropy[t_idx] = entropy_t
-                entropy[s_idx] = entropy_s
-
-                distribution_params = tuple(torch.empty_like(p) for p in batch.old_distribution_params)
-                for i, (pt, ps) in enumerate(zip(dist_params_t, dist_params_s)):
-                    distribution_params[i][t_idx] = pt
-                    distribution_params[i][s_idx] = ps
+            # Recompute actions log prob and entropy for current batch of transitions
+            # Note: We need to do this because we updated the policy with the new parameters
+            # For gradient penalty, enable grad on the raw policy obs so we can differentiate.
+            if self.grad_penalty_coef_schedule is not None:
+                policy_obs_for_grad = batch.observations[self.actor.raw_obs_key].clone().detach().requires_grad_(True)  # type: ignore[attr-defined]
+                obs_for_grad = batch.observations.clone()
+                obs_for_grad[self.actor.raw_obs_key] = policy_obs_for_grad  # type: ignore[attr-defined]
+                self.actor(
+                    obs_for_grad,
+                    masks=batch.masks,
+                    hidden_state=batch.hidden_states[0],
+                    stochastic_output=True,
+                )
             else:
-                # Fallback: teacher mode only (e.g. all envs are teacher, or non-TSModel)
-                if isinstance(self.actor, TSModel):
-                    self.actor.use_teacher_mode()
-                self.actor(batch.observations, stochastic_output=True)
-                actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
-                distribution_params = tuple(p[:original_batch_size].clone() for p in self.actor.output_distribution_params)
-                entropy = self.actor.output_entropy[:original_batch_size]
-
+                self.actor(
+                    batch.observations,
+                    masks=batch.masks,
+                    hidden_state=batch.hidden_states[0],
+                    stochastic_output=True,
+                )
+            actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
             values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
+            # Note: We only keep the distribution parameters and entropy of the first augmentation (the original one)
+            distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
+            entropy = self.actor.output_entropy[:original_batch_size]
 
-            # ── KL divergence → adaptive learning rate ────────────────────────────────
+            # Compute KL divergence and adapt the learning rate
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
                     kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
-                    kl_mean = kl.mean()
+                    kl_mean = torch.mean(kl)
+
+                    # Reduce the KL divergence across all GPUs
                     if self.is_multi_gpu:
                         torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
                         kl_mean /= self.gpu_world_size
+
+                    # Update the learning rate only on the main process
                     if self.gpu_global_rank == 0:
                         if kl_mean > self.desired_kl * 2.0:
                             self.learning_rate = max(1e-5, self.learning_rate / 1.5)
                         elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
                             self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+
+                    # Update the learning rate for all GPUs
                     if self.is_multi_gpu:
                         lr_tensor = torch.tensor(self.learning_rate, device=self.device)
                         torch.distributed.broadcast(lr_tensor, src=0)
                         self.learning_rate = lr_tensor.item()
+
+                    # Update the learning rate for all parameter groups
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
-            # ── Surrogate loss ────────────────────────────────────────────────────────
+            # Surrogate loss
             ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
             surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
             surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
@@ -377,136 +429,166 @@ class PPO:
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-            # ── Value loss ────────────────────────────────────────────────────────────
+            # Value function loss
             if self.use_clipped_value_loss:
                 value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
-                value_loss = torch.max((values - batch.returns).pow(2), (value_clipped - batch.returns).pow(2)).mean()
+                value_losses = (values - batch.returns).pow(2)
+                value_losses_clipped = (value_clipped - batch.returns).pow(2)
+                value_loss = torch.max(value_losses, value_losses_clipped).mean()
             else:
                 value_loss = (batch.returns - values).pow(2).mean()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
-            # ── Gradient penalty (teacher group only) ────────────────────────────────
-            if self.grad_penalty_coef_schedule is not None and gradient_penalty_coef > 0.0:
-                obs_t = batch.observations[t_idx] if (is_cts and batch.teacher_mask is not None) else batch.observations
-                policy_obs_for_grad = obs_t[self.actor.raw_obs_key].clone().detach().requires_grad_(True)  # type: ignore[attr-defined]
-                obs_for_grad = obs_t.clone()
-                obs_for_grad[self.actor.raw_obs_key] = policy_obs_for_grad  # type: ignore[attr-defined]
-                if isinstance(self.actor, TSModel):
-                    self.actor.use_teacher_mode()
-                self.actor(obs_for_grad, stochastic_output=True)
-                lp = self.actor.get_output_log_prob(batch.actions[t_idx] if (is_cts and batch.teacher_mask is not None) else batch.actions)
-                grad_log_prob = torch.autograd.grad(lp.sum(), policy_obs_for_grad, create_graph=True)[0]
+            # Lipschitz gradient penalty on policy observations
+            if self.grad_penalty_coef_schedule is not None:
+                grad_log_prob = torch.autograd.grad(
+                    outputs=actions_log_prob.sum(),
+                    inputs=policy_obs_for_grad,
+                    create_graph=True,
+                )[0]
                 gradient_penalty = torch.sum(torch.square(grad_log_prob), dim=-1).mean()
                 loss = loss + gradient_penalty_coef * gradient_penalty
                 mean_gradient_penalty += gradient_penalty.item()
 
-            # ── RND ───────────────────────────────────────────────────────────────────
-            if self.rnd:
-                with torch.no_grad():
-                    rnd_state = self.rnd.state_normalizer(self.rnd.get_rnd_state(batch.observations[:original_batch_size]))  # type: ignore
-                predicted_embedding = self.rnd.predictor(rnd_state)
-                target_embedding = self.rnd.target(rnd_state).detach()
-                rnd_loss = torch.nn.MSELoss()(predicted_embedding, target_embedding)
-
-            # ── Symmetry ──────────────────────────────────────────────────────────────
+            # Symmetry loss
             if self.symmetry:
+                # Obtain the symmetric actions
+                # Note: If we did augmentation before then we don't need to augment again
                 if not self.symmetry["use_data_augmentation"]:
-                    batch.observations, _ = self.symmetry["data_augmentation_func"](
+                    data_augmentation_func = self.symmetry["data_augmentation_func"]
+                    batch.observations, _ = data_augmentation_func(
                         obs=batch.observations, actions=None, env=self.symmetry["_env"]
                     )
-                if isinstance(self.actor, TSModel):
-                    self.actor.use_teacher_mode()
+
+                # Actions predicted by the actor for symmetrically-augmented observations
                 mean_actions = self.actor(batch.observations.detach().clone())
+
+                # Compute the symmetrically augmented actions
+                # Note: We are assuming the first augmentation is the original one. We do not use the batch.actions from
+                # earlier since that action was sampled from the distribution. However, the symmetry loss is computed
+                # using the mean of the distribution.
                 action_mean_orig = mean_actions[:original_batch_size]
-                _, actions_mean_symm = self.symmetry["data_augmentation_func"](
+                _, actions_mean_symm = data_augmentation_func(
                     obs=None, actions=action_mean_orig, env=self.symmetry["_env"]
                 )
-                symmetry_loss = torch.nn.MSELoss()(
+
+                # Compute the loss
+                mse_loss = torch.nn.MSELoss()
+                symmetry_loss = mse_loss(
                     mean_actions[original_batch_size:], actions_mean_symm.detach()[original_batch_size:]
                 )
+                # Add the loss to the total loss
                 if self.symmetry["use_mirror_loss"]:
                     loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
                 else:
                     symmetry_loss = symmetry_loss.detach()
 
-            # ── PPO backward ──────────────────────────────────────────────────────────
+            # RND loss
+            if self.rnd:
+                # Extract the rnd_state
+                with torch.no_grad():
+                    rnd_state = self.rnd.get_rnd_state(batch.observations[:original_batch_size])  # type: ignore
+                    rnd_state = self.rnd.state_normalizer(rnd_state)
+                # Predict the embedding and the target
+                predicted_embedding = self.rnd.predictor(rnd_state)
+                target_embedding = self.rnd.target(rnd_state).detach()
+                # Compute the loss as the mean squared error
+                mseloss = torch.nn.MSELoss()
+                rnd_loss = mseloss(predicted_embedding, target_embedding)
+
+            # Compute the gradients for PPO
             self.optimizer.zero_grad()
             loss.backward()
+            # Compute the gradients for RND
             if self.rnd:
                 self.rnd_optimizer.zero_grad()
                 rnd_loss.backward()
+
+            # Collect gradients from all GPUs
             if self.is_multi_gpu:
                 self.reduce_parameters()
-            # Clip only main-optimizer params (exclude proprio_encoder which is in extra_optimizer)
-            actor_main_params = [p for n, p in self.actor.named_parameters() if "proprioceptive_encoder" not in n]
-            nn.utils.clip_grad_norm_(actor_main_params, self.max_grad_norm)
+
+            # Apply the gradients for PPO
+            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            # Apply the gradients for RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
 
-            # ── Teacher vs student gap (diagnostic, no gradient) ─────────────────────
+            # Extra gradient step: distill privileged latent into proprioceptive encoder
+            # Only in simultaneous mode (teacher_phase_iters == 0); 2-phase mode handles above.
+            if self.extra_optimizer is not None and self.teacher_phase_iters == 0:
+                for _ in range(self.num_proprio_encoder_substeps):
+                    proprio_latent = self.actor.proprio_encode(batch.observations)  # type: ignore[attr-defined]
+                    privileged_latent = self.actor.privileged_encode(batch.observations).detach()  # type: ignore[attr-defined]
+                    proprio_extra_loss = F.mse_loss(privileged_latent, proprio_latent)
+                    self.extra_optimizer.zero_grad()
+                    proprio_extra_loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        self.actor.proprioceptive_encoder.parameters(), self.max_grad_norm  # type: ignore[union-attr]
+                    )
+                    self.extra_optimizer.step()
+                    mean_proprio_extra_loss += proprio_extra_loss.item()
+
+            # Teacher vs student action MSE — measures deploy gap (no gradient)
+            from rsl_rl.models.ts_model import TSModel
             if isinstance(self.actor, TSModel) and self.actor.proprioceptive_encoder is not None:
                 with torch.inference_mode():
                     teacher_act = self.actor.act_inference_teacher(batch.observations)
                     student_act = self.actor.act_inference_student(batch.observations)
                     mean_teacher_student_mse += F.mse_loss(teacher_act, student_act).item()
 
+            # Store the losses
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy.mean().item()
+            # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
+            # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
 
+        # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
         mean_gradient_penalty /= num_updates
+        num_updates_extra = num_updates * self.num_proprio_encoder_substeps
+        if num_updates_extra > 0 and self.extra_optimizer is not None:
+            mean_proprio_extra_loss /= num_updates_extra
+            mean_encoder_distill_loss /= num_updates_extra
+            mean_action_distill_loss /= num_updates_extra
         mean_teacher_student_mse /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
 
-        # ── Loop 2 (Algorithm 1, lines 10-12): Supervised — student envs only ────────
-        # Separate loop over student-env mini-batches; updates proprio_encoder only.
-        if is_cts and self.extra_optimizer is not None:
-            for batch in self.storage.student_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs):
-                self.actor.use_teacher_mode()
-                with torch.no_grad():
-                    teacher_latent = self.actor.privileged_encode(batch.observations)  # type: ignore[attr-defined]
-                self.actor.use_student_mode()
-                student_latent = self.actor.proprio_encode(batch.observations)  # type: ignore[attr-defined]
-                rec_loss = F.mse_loss(student_latent, teacher_latent)
-                self.extra_optimizer.zero_grad()
-                rec_loss.backward()
-                nn.utils.clip_grad_norm_(
-                    self.actor.proprioceptive_encoder.parameters(), self.max_grad_norm  # type: ignore[union-attr]
-                )
-                self.extra_optimizer.step()
-                mean_rec_loss += rec_loss.item()
-            mean_rec_loss /= num_updates
-
+        # Clear the storage
         self.storage.clear()
         self.update_counter()
 
+        # Construct the loss dictionary
         loss_dict = {
             "value": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
             "gradient_penalty": mean_gradient_penalty,
             "gradient_penalty_coef": gradient_penalty_coef,
-            "rec_loss": mean_rec_loss,
+            "proprio_extra": mean_proprio_extra_loss,
             "teacher_student_mse": mean_teacher_student_mse,
+            "encoder_distill": mean_encoder_distill_loss,
+            "action_distill": mean_action_distill_loss,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+
         return loss_dict
 
     def update_counter(self) -> None:

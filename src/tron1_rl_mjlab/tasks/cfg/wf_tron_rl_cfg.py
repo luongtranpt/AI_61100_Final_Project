@@ -31,12 +31,16 @@ class RslRlTSActorCfg(RslRlModelCfg):
 
 @dataclass
 class RslRlTSPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
-    """PPO algorithm config for CTS (Concurrent Teacher-Student) training."""
+    """PPO algorithm config extended with teacher-student training options."""
 
     class_name: str = "rsl_rl.algorithms:PPO"
     """Qualified class name so resolve_callable works with the local namespace package."""
-    teacher_ratio: float = 0.75
-    """Fraction of envs acting as teacher group (privileged encoder). Rest is student group."""
+    student_reinforcing: bool = False
+    """If True, train with the proprioceptive encoder in the main loop (no privileged
+    encoder gradient). Used after an initial teacher-supervised phase."""
+    num_proprio_encoder_substeps: int = 1
+    """Extra gradient steps per update to distill the privileged latent into the
+    proprioceptive encoder via MSE loss."""
     grad_penalty_coef_schedule: Optional[List[float]] = field(
         default_factory=lambda: [0.002, 0.002, 0, 1]
     )
@@ -44,6 +48,8 @@ class RslRlTSPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     Set to None to disable the penalty."""
     clip_reward: Optional[float] = 100.0
     """Clip total reward per step to [-clip_reward, clip_reward]. Matches isaacgym clip_reward."""
+    teacher_phase_iters: int = 3000
+    """Train teacher (privileged encoder + MLP) for this many iters, then freeze and train student."""
 
 
 def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
@@ -54,13 +60,12 @@ def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
         save_interval=2000,
         wandb_project="mjlab_wf_tron",
         experiment_name="wf_tron",
-        obs_groups={"actor": ("actor", "history", "critic", "critic_no_vel"), "critic": ("critic",)},
+        obs_groups={"actor": ("actor", "history", "critic"), "critic": ("critic",)},
         actor=RslRlTSActorCfg(
             hidden_dims=(512, 256, 128),
             activation="elu",
             encoder_hidden_dims=(256, 128),
             encoder_latent_dim=16,
-            privileged_obs_key="critic_no_vel",
             distribution_cfg={
                 "class_name": "rsl_rl.modules:GaussianDistribution",
                 "init_std": 1.0,
@@ -84,8 +89,8 @@ def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
             lam=0.95,
             desired_kl=0.01,
             max_grad_norm=1.0,
-            teacher_ratio=0.75,
+            num_proprio_encoder_substeps=1,
             grad_penalty_coef_schedule=[0.002, 0.002, 0, 1],
-            clip_reward=100.0,
+            teacher_phase_iters=4000,
         ),
     )
