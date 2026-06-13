@@ -12,7 +12,7 @@ class WFTronPhaseRunner(MjlabOnPolicyRunner):
 
     FLAT_TERRAIN_ITERS = 0  # train directly on rough terrain from the start
 
-    def __init__(self, env, train_cfg: dict, log_dir: str | None, device: str):
+    def __init__(self, env, train_cfg: dict, log_dir: str | None = None, device: str = "cpu"):
         super().__init__(env, train_cfg, log_dir, device)
         self._flat_terrain_iters: int = self.FLAT_TERRAIN_ITERS
         self._terrain_swapped: bool = False

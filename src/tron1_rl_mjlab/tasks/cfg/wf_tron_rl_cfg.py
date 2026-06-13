@@ -26,6 +26,8 @@ class RslRlTSActorCfg(RslRlModelCfg):
     """TensorDict key for the privileged observations (privileged encoder input)."""
     commands_key: Optional[str] = None
     """TensorDict key for the command/goal vector. None if commands are already in raw_obs_key."""
+    base_lin_vel_key: Optional[str] = "base_vel"
+    """TensorDict key for ground-truth base linear velocity (teacher input + student supervision)."""
 
 
 
@@ -47,20 +49,17 @@ class RslRlTSPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
 
 
 def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
-    """Create RL runner configuration for WF-TRON task."""
+    """Baseline: plain MLP actor on raw obs (31 dims), standard PPO, no encoder."""
     return RslRlOnPolicyRunnerCfg(
         num_steps_per_env=24,
         max_iterations=1500000,
         save_interval=2000,
         wandb_project="mjlab_wf_tron",
         experiment_name="wf_tron",
-        obs_groups={"actor": ("actor", "history", "critic", "critic_no_vel"), "critic": ("critic",)},
-        actor=RslRlTSActorCfg(
+        obs_groups={"actor": ("actor",), "critic": ("critic",)},
+        actor=RslRlModelCfg(
             hidden_dims=(512, 256, 128),
             activation="elu",
-            encoder_hidden_dims=(256, 128),
-            encoder_latent_dim=16,
-            privileged_obs_key="critic_no_vel",
             distribution_cfg={
                 "class_name": "rsl_rl.modules:GaussianDistribution",
                 "init_std": 1.0,
@@ -71,7 +70,7 @@ def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
             hidden_dims=(512, 256, 128),
             activation="elu",
         ),
-        algorithm=RslRlTSPpoAlgorithmCfg(
+        algorithm=RslRlPpoAlgorithmCfg(
             value_loss_coef=1.0,
             use_clipped_value_loss=True,
             clip_param=0.2,
@@ -84,8 +83,5 @@ def make_wf_tron_rl_cfg() -> RslRlOnPolicyRunnerCfg:
             lam=0.95,
             desired_kl=0.01,
             max_grad_norm=1.0,
-            teacher_ratio=0.75,
-            grad_penalty_coef_schedule=[0.002, 0.002, 0, 1],
-            clip_reward=100.0,
         ),
     )

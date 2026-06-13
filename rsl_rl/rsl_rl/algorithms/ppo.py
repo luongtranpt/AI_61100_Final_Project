@@ -144,11 +144,12 @@ class PPO:
             self.optimizer = resolve_optimizer(optimizer)(
                 chain(actor_main_params, self.critic.parameters()), lr=learning_rate
             )  # type: ignore
-            # Extra optimizer: proprioceptive encoder only (supervised reconstruction loss)
+            # Extra optimizer: proprioceptive encoder + vel_predictor (supervised losses)
             if self.actor.proprioceptive_encoder is not None:
-                self.extra_optimizer = optim.Adam(
-                    self.actor.proprioceptive_encoder.parameters(), lr=1e-3
-                )
+                extra_params = list(self.actor.proprioceptive_encoder.parameters())
+                if getattr(self.actor, "vel_predictor", None) is not None:
+                    extra_params += list(self.actor.vel_predictor.parameters())
+                self.extra_optimizer = optim.Adam(extra_params, lr=1e-3)
 
         # Add storage
         self.storage = storage
@@ -275,6 +276,7 @@ class PPO:
         mean_entropy = 0.0
         mean_gradient_penalty = 0.0
         mean_rec_loss = 0.0
+        mean_vel_pred_loss = 0.0
         mean_teacher_student_mse = 0.0
         mean_rnd_loss = 0 if self.rnd else None
         mean_symmetry_loss = 0 if self.symmetry else None
@@ -392,8 +394,7 @@ class PPO:
                 policy_obs_for_grad = obs_t[self.actor.raw_obs_key].clone().detach().requires_grad_(True)  # type: ignore[attr-defined]
                 obs_for_grad = obs_t.clone()
                 obs_for_grad[self.actor.raw_obs_key] = policy_obs_for_grad  # type: ignore[attr-defined]
-                if isinstance(self.actor, TSModel):
-                    self.actor.use_teacher_mode()
+                self.actor.use_teacher_mode()
                 self.actor(obs_for_grad, stochastic_output=True)
                 lp = self.actor.get_output_log_prob(batch.actions[t_idx] if (is_cts and batch.teacher_mask is not None) else batch.actions)
                 grad_log_prob = torch.autograd.grad(lp.sum(), policy_obs_for_grad, create_graph=True)[0]
@@ -415,8 +416,7 @@ class PPO:
                     batch.observations, _ = self.symmetry["data_augmentation_func"](
                         obs=batch.observations, actions=None, env=self.symmetry["_env"]
                     )
-                if isinstance(self.actor, TSModel):
-                    self.actor.use_teacher_mode()
+                self.actor.use_teacher_mode()
                 mean_actions = self.actor(batch.observations.detach().clone())
                 action_mean_orig = mean_actions[:original_batch_size]
                 _, actions_mean_symm = self.symmetry["data_augmentation_func"](
@@ -476,20 +476,34 @@ class PPO:
         # Separate loop over student-env mini-batches; updates proprio_encoder only.
         if is_cts and self.extra_optimizer is not None:
             for batch in self.storage.student_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs):
+                # Encoder reconstruction loss: pull student latent toward teacher latent
                 self.actor.use_teacher_mode()
                 with torch.no_grad():
                     teacher_latent = self.actor.privileged_encode(batch.observations)  # type: ignore[attr-defined]
                 self.actor.use_student_mode()
                 student_latent = self.actor.proprio_encode(batch.observations)  # type: ignore[attr-defined]
                 rec_loss = F.mse_loss(student_latent, teacher_latent)
+
+                # Velocity predictor loss: student predicts base_lin_vel from history
+                vel_pred_loss = torch.tensor(0.0, device=self.device)
+                actor = self.actor  # type: ignore[attr-defined]
+                if getattr(actor, "vel_predictor", None) is not None and actor.base_lin_vel_key is not None:
+                    predicted_vel = actor.predict_vel(batch.observations)
+                    true_vel = batch.observations[actor.base_lin_vel_key].detach()
+                    vel_pred_loss = F.mse_loss(predicted_vel, true_vel)
+
+                total_loss = rec_loss + vel_pred_loss
                 self.extra_optimizer.zero_grad()
-                rec_loss.backward()
-                nn.utils.clip_grad_norm_(
-                    self.actor.proprioceptive_encoder.parameters(), self.max_grad_norm  # type: ignore[union-attr]
-                )
+                total_loss.backward()
+                extra_params = list(self.actor.proprioceptive_encoder.parameters())  # type: ignore[union-attr]
+                if getattr(actor, "vel_predictor", None) is not None:
+                    extra_params += list(actor.vel_predictor.parameters())
+                nn.utils.clip_grad_norm_(extra_params, self.max_grad_norm)
                 self.extra_optimizer.step()
                 mean_rec_loss += rec_loss.item()
+                mean_vel_pred_loss += vel_pred_loss.item()
             mean_rec_loss /= num_updates
+            mean_vel_pred_loss /= num_updates
 
         self.storage.clear()
         self.update_counter()
@@ -501,6 +515,7 @@ class PPO:
             "gradient_penalty": mean_gradient_penalty,
             "gradient_penalty_coef": gradient_penalty_coef,
             "rec_loss": mean_rec_loss,
+            "vel_pred_loss": mean_vel_pred_loss,
             "teacher_student_mse": mean_teacher_student_mse,
         }
         if self.rnd:
