@@ -1,4 +1,4 @@
-# AI_61100 Final Project — WF-TRON Locomotion
+# WF-TRON Locomotion 
 
 Reinforcement learning for a wheeled-footed biped robot (WF-TRON, 8 DOF) using MuJoCo.  
 Compares four training strategies: Baseline PPO, Two-Phase Teacher-Student, and two variants of Concurrent Teacher-Student (CTS).
